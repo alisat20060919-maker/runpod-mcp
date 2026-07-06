@@ -311,6 +311,12 @@ export function createToolRuntime(
     (async (url, opts) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), opts.maxWaitMs);
+      // Collect raw Buffers and decode ONCE at the end: avoids both a UTF-8 char
+      // being split across two network chunks (per-chunk toString would corrupt
+      // it) and the O(n²) cost of re-measuring a growing string.
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let truncated = false;
       try {
         const res = await fetch(url, {
           method: 'GET',
@@ -328,31 +334,25 @@ export function createToolRuntime(
             await res.text().catch(() => '')
           );
         }
-        // Collect raw Buffers and decode ONCE at the end: avoids both a UTF-8
-        // char being split across two network chunks (per-chunk toString would
-        // corrupt it) and the O(n²) cost of re-measuring a growing string.
-        const chunks: Buffer[] = [];
-        let bytes = 0;
-        let truncated = false;
-        try {
-          for await (const chunk of res.body as AsyncIterable<Buffer>) {
-            chunks.push(chunk);
-            bytes += chunk.length;
-            if (bytes >= opts.maxBytes) {
-              truncated = true;
-              controller.abort();
-              break;
-            }
+        for await (const chunk of res.body as AsyncIterable<Buffer>) {
+          chunks.push(chunk);
+          bytes += chunk.length;
+          if (bytes >= opts.maxBytes) {
+            truncated = true;
+            controller.abort();
+            break;
           }
-        } catch (err) {
-          // AbortError (timeout or byte-cap abort) is the expected stream end —
-          // keep what we read. Anything else propagates.
-          if (!(err instanceof Error && err.name === 'AbortError')) throw err;
         }
-        return { raw: Buffer.concat(chunks).toString('utf8'), truncated };
+      } catch (err) {
+        // A timeout or byte-cap abort is a NORMAL end of a bounded snapshot —
+        // whether it fires while connecting (thrown from `await fetch`) or mid
+        // body read, keep what we collected. Anything else (incl. HttpError on a
+        // non-OK status) propagates.
+        if (!(err instanceof Error && err.name === 'AbortError')) throw err;
       } finally {
         clearTimeout(timer);
       }
+      return { raw: Buffer.concat(chunks).toString('utf8'), truncated };
     });
 
   const backendFor = (resource: Resource): Backend =>
