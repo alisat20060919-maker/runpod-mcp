@@ -4,14 +4,16 @@ import type { StreamSse } from './runtime.js';
 // ============== SHARED LOG STREAMING ==============
 // Both pod logs (GET /v2/pods/{id}/logs) and serverless worker logs
 // (GET /v2/serverless/{id}/workers/{workerId}/logs) are Server-Sent-Event
-// streams with an identical query contract and payload shape. This module holds
-// the pieces they share — the SSE frame parser, the tool parameter schema, and
-// the bounded read/parse step — so the two tool handlers stay thin and the
-// risky parsing/query logic is unit-tested once, offline.
+// streams with an identical contract: `content-type: text/event-stream` of
+// `data: {"source","line","ts"}` frames (each frame optionally preceded by an
+// `id:` = ts line for EventSource `Last-Event-ID` resume). This module holds the
+// pieces they share — the SSE frame parser, the tool parameter schema, and the
+// bounded read step — so the two tool handlers stay thin and the risky parsing
+// logic is unit-tested once, offline.
 
-// One parsed log entry: the source it came from, the message line, and its
-// RFC3339 timestamp. A payload we can't structure is preserved verbatim under
-// `raw` rather than dropped.
+// One parsed SSE log frame. The API emits `data: {"source","line","ts"}` events;
+// a frame whose payload doesn't parse as JSON is preserved verbatim under `raw`
+// rather than dropped.
 export interface LogEntry {
   source?: string;
   line?: string;
@@ -19,75 +21,11 @@ export interface LogEntry {
   raw?: string;
 }
 
-// Split an `"<rfc3339-ts> <message>"` log string (the shape prod returns inside
-// the container/system arrays) into its timestamp and message. If there's no
-// space, the whole string is the line and the timestamp is unknown.
-function splitTsLine(s: string): { ts?: string; line: string } {
-  const i = s.indexOf(' ');
-  if (i === -1) return { line: s };
-  return { ts: s.slice(0, i), line: s.slice(i + 1) };
-}
-
-// Parse a log-endpoint response body into entries, handling BOTH shapes the API
-// can return:
-//
-//  1. Prod today: a single JSON object `{ "container": [...], "system": [...] }`
-//     where each element is `"<rfc3339-ts> <message>"`. The response declares
-//     `content-type: text/event-stream` but is really a one-shot snapshot, and
-//     the `source` query param is ignored (both keys always come back) — so we
-//     honor `source` client-side here.
-//  2. The OpenAPI-documented SSE stream: `data: {"source","line","ts"}` frames
-//     (see parseLogSse). Kept as a fallback so the tool keeps working if/when the
-//     endpoint switches to true streaming.
-//
-// When both sources are wanted, entries are merged and sorted by timestamp so
-// container and system logs interleave chronologically.
-export function parseLogPayload(
-  raw: string,
-  source: 'container' | 'system' | 'both' = 'both'
-): LogEntry[] {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('{')) {
-    try {
-      const obj = JSON.parse(trimmed) as Record<string, unknown>;
-      if (
-        obj &&
-        typeof obj === 'object' &&
-        !Array.isArray(obj) &&
-        (Array.isArray(obj.container) || Array.isArray(obj.system))
-      ) {
-        const wanted =
-          source === 'both' ? (['container', 'system'] as const) : [source];
-        const entries: LogEntry[] = [];
-        for (const src of wanted) {
-          const arr = obj[src];
-          if (!Array.isArray(arr)) continue;
-          for (const item of arr) {
-            if (typeof item !== 'string') {
-              entries.push({ source: src, raw: JSON.stringify(item) });
-              continue;
-            }
-            entries.push({ source: src, ...splitTsLine(item) });
-          }
-        }
-        // Same zero-padded RFC3339 format across sources, so a lexicographic
-        // sort is chronological. Best-effort: entries without a ts sort first.
-        if (source === 'both')
-          entries.sort((a, b) => (a.ts ?? '').localeCompare(b.ts ?? ''));
-        return entries;
-      }
-    } catch {
-      // Not the JSON snapshot shape — fall through to the SSE frame parser.
-    }
-  }
-  return parseLogSse(raw);
-}
-
-// Parse raw SSE event-stream text into log entries (shape 2 above). Pure (no
-// I/O), so the parsing logic is unit-tested without a network. SSE events are
-// separated by a blank line; the payload is the `data:` field (possibly spanning
-// multiple `data:` lines per the SSE spec). Non-JSON payloads fall back to
-// `{raw}`. Comment lines (`:`...) and other fields (event:/id:) are ignored.
+// Parse raw SSE event-stream text into log entries. Pure (no I/O), so the risky
+// parsing logic is unit-tested without a network. SSE events are separated by a
+// blank line; the payload is the `data:` field (possibly spanning multiple
+// `data:` lines per the SSE spec). Non-JSON payloads fall back to `{raw}`. Other
+// fields (`id:`/`event:`) and comment lines (`:`...) are ignored.
 export function parseLogSse(raw: string): LogEntry[] {
   const items: LogEntry[] = [];
   for (const block of raw.split(/\r?\n\r?\n/)) {
@@ -150,12 +88,12 @@ export interface LogStreamParams {
   maxWaitMs?: number;
 }
 
-// Bounded read of a log endpoint. Builds the query string, reads up to the
-// byte/time cap via the injected `streamSse`, and returns the parsed entries.
+// Bounded read of a log SSE endpoint. Builds the query string, reads up to the
+// byte/time cap via the injected `streamSse`, and returns the parsed frames.
 // `source: 'both'` (or omitted) sends NO `source` param — the wire enum is only
-// container|system, and prod ignores it anyway (both keys always come back), so
-// the actual source filtering happens client-side in parseLogPayload. Throws
-// HttpError on a non-OK response (the caller maps it to a JSON error reply).
+// container|system, and the endpoint returns both streams when it is absent.
+// Throws HttpError on a non-OK response (the caller maps it to a JSON error
+// reply).
 export async function collectLogSnapshot(
   streamSse: StreamSse,
   logsUrl: string,
@@ -171,6 +109,6 @@ export async function collectLogSnapshot(
     maxWaitMs: params.maxWaitMs ?? LOG_STREAM_DEFAULT_WAIT_MS,
     maxBytes: LOG_STREAM_MAX_BYTES,
   });
-  const items = parseLogPayload(raw, params.source ?? 'both');
+  const items = parseLogSse(raw);
   return { items, count: items.length, truncated };
 }

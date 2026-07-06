@@ -1546,26 +1546,20 @@ describe('endpoint routing under v1 (templateId model preserved)', () => {
 });
 
 // ============== Log streaming (stream-pod-logs / stream-worker-logs) ==========
-// Both are v2-only. The 501-on-v1 behaviour is covered by the V2_ONLY sweep
-// above; here we drive the v2 happy path through the injected `streamSse` seam
-// (the real reader uses node-fetch directly, bypassing the fake fetch) and lock
-// the URL/query building AND the parse of the real prod response shape — a JSON
-// snapshot `{container:[...],system:[...]}` of "<ts> <line>" strings (NOT SSE
-// frames, despite the content-type). The pure parser is unit-tested in
-// mappers.test.ts.
+// Both are v2-only SSE tools. The 501-on-v1 behaviour is covered by the V2_ONLY
+// sweep above; here we drive the v2 happy path through the injected `streamSse`
+// seam (the real reader uses node-fetch directly, bypassing the fake fetch) and
+// lock the URL/query building + the parse of the SSE `data:` frame body. The
+// pure frame parser is unit-tested in mappers.test.ts.
 describe('log streaming tools (v2-only)', () => {
-  // The actual prod body: one JSON object, each array element "<ts> <message>".
-  // The `source` query param is ignored server-side (both keys always return),
-  // so the tool must filter client-side.
-  const PROD_LOG_BODY = JSON.stringify({
-    container: [
-      '2026-07-06T15:24:58.7Z CUDA 12.4.1',
-      '2026-07-06T15:24:59.6Z pod is ready',
-    ],
-    system: ['2026-07-06T15:24:56Z create container'],
-  });
+  // A realistic SSE body: `id:` line + `data: {source,line,ts}` frame per event.
+  const SSE_BODY =
+    'id: 2026-07-06T22:04:13Z\n' +
+    'data: {"source":"system","line":"create 20GB volume","ts":"2026-07-06T22:04:13Z"}\n\n' +
+    'id: 2026-07-06T22:04:14Z\n' +
+    'data: {"source":"container","line":"CUDA 12.4.1","ts":"2026-07-06T22:04:14Z"}\n\n';
 
-  function recordingStreamSse(raw: string = PROD_LOG_BODY) {
+  function recordingStreamSse(raw: string = SSE_BODY) {
     const calls: Array<{ url: string; maxWaitMs: number; maxBytes: number }> =
       [];
     const streamSse = async (
@@ -1578,7 +1572,7 @@ describe('log streaming tools (v2-only)', () => {
     return { calls, streamSse };
   }
 
-  it('stream-pod-logs → GET <v2>/v2/pods/{id}/logs, parses prod JSON snapshot, merges sources by ts', async () => {
+  it('stream-pod-logs → GET <v2>/v2/pods/{id}/logs, parses SSE frames', async () => {
     await withV2(async () => {
       const { calls, streamSse } = recordingStreamSse();
       const { handlers } = harness({ streamSse });
@@ -1592,25 +1586,23 @@ describe('log streaming tools (v2-only)', () => {
       assert.equal(calls[0].maxWaitMs, 5000);
       assert.equal(calls[0].maxBytes, 256 * 1024);
       const body = parseText(out);
-      assert.equal(body.count, 3);
+      assert.equal(body.count, 2);
       const items = body.items as Array<Record<string, string>>;
-      // Merged + sorted by ts: the system line (…56Z) comes first.
       assert.deepEqual(items[0], {
         source: 'system',
-        ts: '2026-07-06T15:24:56Z',
-        line: 'create container',
+        line: 'create 20GB volume',
+        ts: '2026-07-06T22:04:13Z',
       });
       assert.equal(items[1].source, 'container');
-      assert.equal(items[1].line, 'CUDA 12.4.1');
       assert.equal(body.truncated, false);
     });
   });
 
-  it('stream-pod-logs source=container: sends the param AND filters client-side', async () => {
+  it('stream-pod-logs forwards source/tail/since + maxWaitMs (source=both omitted)', async () => {
     await withV2(async () => {
       const { calls, streamSse } = recordingStreamSse();
       const { handlers } = harness({ streamSse });
-      const out = await handlers.get('stream-pod-logs')!({
+      await handlers.get('stream-pod-logs')!({
         podId: 'pod_2',
         source: 'container',
         tail: 50,
@@ -1622,10 +1614,6 @@ describe('log streaming tools (v2-only)', () => {
         'https://v2-rest.runpod.io/v2/pods/pod_2/logs?source=container&tail=50&since=2026-05-01T22%3A00%3A00Z'
       );
       assert.equal(calls[0].maxWaitMs, 8000);
-      const items = parseText(out).items as Array<Record<string, string>>;
-      // Body carried both keys, but source=container drops the system entry.
-      assert.equal(items.length, 2);
-      assert.ok(items.every((i) => i.source === 'container'));
     });
   });
 
@@ -1643,20 +1631,6 @@ describe('log streaming tools (v2-only)', () => {
         calls[0].url,
         'https://v2-rest.runpod.io/v2/serverless/ep_1/workers/w_9/logs?source=system&tail=0'
       );
-      const items = parseText(out).items as Array<Record<string, string>>;
-      assert.equal(items.length, 1);
-      assert.equal(items[0].source, 'system');
-    });
-  });
-
-  it('falls back to SSE frame parsing when the body is a data: stream', async () => {
-    await withV2(async () => {
-      const sse =
-        'data: {"source":"container","line":"hello","ts":"t1"}\n\n' +
-        'data: {"source":"system","line":"up","ts":"t2"}\n\n';
-      const { streamSse } = recordingStreamSse(sse);
-      const { handlers } = harness({ streamSse });
-      const out = await handlers.get('stream-pod-logs')!({ podId: 'pod_3' });
       assert.equal(parseText(out).count, 2);
     });
   });
