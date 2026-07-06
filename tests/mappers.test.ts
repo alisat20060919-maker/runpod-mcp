@@ -12,7 +12,7 @@ import {
   mapEndpointCreateToV2,
   mapEndpointUpdateToV2,
 } from '../src/_shared/mappers.js';
-import { parseLogSse } from '../src/tools/logs.js';
+import { parseLogSse, parseLogPayload } from '../src/tools/logs.js';
 
 const fixture = JSON.parse(
   readFileSync(
@@ -319,5 +319,61 @@ describe('parseLogSse', () => {
 
   it('empty stream → no items', () => {
     assert.deepEqual(parseLogSse(''), []);
+  });
+});
+
+describe('parseLogPayload (prod JSON snapshot shape)', () => {
+  // The real prod body: one JSON object, each element "<rfc3339-ts> <message>".
+  const body = JSON.stringify({
+    container: [
+      '2026-07-06T15:24:58.7Z CUDA 12.4.1',
+      '2026-07-06T15:24:59.6Z pod is ready',
+    ],
+    system: ['2026-07-06T15:24:56Z create container'],
+  });
+
+  it('splits "<ts> <line>" into {source, ts, line}', () => {
+    const items = parseLogPayload(body, 'container');
+    assert.deepEqual(items[0], {
+      source: 'container',
+      ts: '2026-07-06T15:24:58.7Z',
+      line: 'CUDA 12.4.1',
+    });
+    assert.equal(items.length, 2);
+  });
+
+  it('both (default) merges container + system sorted by ts', () => {
+    const items = parseLogPayload(body);
+    assert.equal(items.length, 3);
+    // system …56Z sorts before container …58.7Z / …59.6Z.
+    assert.equal(items[0].source, 'system');
+    assert.equal(items[0].ts, '2026-07-06T15:24:56Z');
+    assert.equal(items[2].line, 'pod is ready');
+  });
+
+  it('source filter selects a single stream client-side', () => {
+    const sys = parseLogPayload(body, 'system');
+    assert.equal(sys.length, 1);
+    assert.equal(sys[0].source, 'system');
+  });
+
+  it('a line with no space keeps the whole string as line (ts undefined)', () => {
+    const items = parseLogPayload(
+      JSON.stringify({ container: ['no-space-line'] }),
+      'container'
+    );
+    assert.deepEqual(items, [{ source: 'container', line: 'no-space-line' }]);
+  });
+
+  it('falls back to SSE parsing for a data: stream body', () => {
+    const items = parseLogPayload('data: {"line":"x"}\n\n', 'both');
+    assert.deepEqual(
+      items.map((i) => i.line),
+      ['x']
+    );
+  });
+
+  it('non-log JSON (no container/system) falls through to SSE parse → []', () => {
+    assert.deepEqual(parseLogPayload('{"foo":1}', 'both'), []);
   });
 });
