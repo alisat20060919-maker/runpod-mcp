@@ -4,12 +4,12 @@ import { capListResult, listPaginationParams } from '../pagination.js';
 import { HttpError } from '../_shared/http.js';
 import { restV1Base } from '../_shared/backend.js';
 import { READ_ONLY, WRITE, DESTRUCTIVE, type ToolRuntime } from './runtime.js';
-import { collectLogSnapshot, logStreamParams } from './logs.js';
+import { logStreamParams, streamLogsReply } from './logs.js';
 
 // ============== POD MANAGEMENT TOOLS ==============
 
 export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
-  const { jsonReply, callRestUrl, backendFor, podAction, streamSse, env } = rt;
+  const { jsonReply, callRestUrl, backendFor, podAction, env } = rt;
 
   // List Pods
   server.tool(
@@ -367,8 +367,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
   );
 
   // Stream Pod Logs (v2-only — GET /v2/pods/{id}/logs, Server-Sent Events).
-  // Reads a bounded snapshot of the live stream (see collectLogSnapshot) and
-  // returns the parsed frames; returns a 501 notice on the v1 API.
+  // Stream Pod Logs (v2-only — GET /v2/pods/{id}/logs). See streamLogsReply.
   server.tool(
     'stream-pod-logs',
     "Fetch a bounded snapshot of a pod's live logs (container and/or system) via Server-Sent Events. v2-only — returns a 501 notice on the v1 API. Reads for up to maxWaitMs (default 5s) and returns the collected log lines; use `tail` to backfill recent lines first. Large output is truncated (see the `truncated` flag).",
@@ -377,29 +376,17 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
       ...logStreamParams,
     },
     { title: 'Stream pod logs', ...READ_ONLY },
-    async (params) => {
-      const backend = backendFor('pods');
-      if (backend.version === 'v1') {
-        return jsonReply({
-          error:
-            'stream-pod-logs is only available on the v2 REST API. Set RUNPOD_REST_VERSION=v2.',
-          status: 501,
-        });
-      }
-      try {
-        const result = await collectLogSnapshot(
-          streamSse,
-          `${backend.base}${backend.get!(params.podId)}/logs`,
-          params
-        );
-        return jsonReply(result);
-      } catch (error) {
-        if (error instanceof HttpError) {
-          return jsonReply({ error: error.message, status: error.status });
-        }
-        throw error;
-      }
-    }
+    (params) =>
+      streamLogsReply(
+        rt,
+        {
+          name: 'stream-pod-logs',
+          resource: 'pods',
+          logsUrl: (backend) =>
+            `${backend.base}${backend.get!(params.podId)}/logs`,
+        },
+        params
+      )
   );
 
   // Delete Pod

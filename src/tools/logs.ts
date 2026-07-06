@@ -1,19 +1,16 @@
 import { z } from 'zod';
-import type { StreamSse } from './runtime.js';
+import { HttpError } from '../_shared/http.js';
+import type { Backend, Resource } from '../_shared/backend.js';
+import type { StreamSse, ToolRuntime } from './runtime.js';
 
 // ============== SHARED LOG STREAMING ==============
-// Both pod logs (GET /v2/pods/{id}/logs) and serverless worker logs
-// (GET /v2/serverless/{id}/workers/{workerId}/logs) are Server-Sent-Event
-// streams with an identical contract: `content-type: text/event-stream` of
-// `data: {"source","line","ts"}` frames (each frame optionally preceded by an
-// `id:` = ts line for EventSource `Last-Event-ID` resume). This module holds the
-// pieces they share — the SSE frame parser, the tool parameter schema, and the
-// bounded read step — so the two tool handlers stay thin and the risky parsing
-// logic is unit-tested once, offline.
+// Pod logs (GET /v2/pods/{id}/logs) and worker logs
+// (GET /v2/serverless/{id}/workers/{workerId}/logs) are the same feature on two
+// resources: an SSE stream of `data: {source,line,ts}` frames. This module holds
+// everything they share — the frame parser, the param schema, the bounded read,
+// and the tool handler — so each tool registration is just a name + a URL.
 
-// One parsed SSE log frame. The API emits `data: {"source","line","ts"}` events;
-// a frame whose payload doesn't parse as JSON is preserved verbatim under `raw`
-// rather than dropped.
+// One parsed log frame. A payload that isn't JSON is kept verbatim under `raw`.
 export interface LogEntry {
   source?: string;
   line?: string;
@@ -21,17 +18,15 @@ export interface LogEntry {
   raw?: string;
 }
 
-// Parse raw SSE event-stream text into log entries. Pure (no I/O), so the risky
-// parsing logic is unit-tested without a network. SSE events are separated by a
-// blank line; the payload is the `data:` field (possibly spanning multiple
-// `data:` lines per the SSE spec). Non-JSON payloads fall back to `{raw}`. Other
-// fields (`id:`/`event:`) and comment lines (`:`...) are ignored.
+// Parse SSE text into log frames. Pure, so it's unit-tested without a network.
+// Events are separated by a blank line; only `data:` fields are read (`id:`,
+// `event:`, and `:` comments are ignored). A `data:` field may span several lines.
 export function parseLogSse(raw: string): LogEntry[] {
   const items: LogEntry[] = [];
   for (const block of raw.split(/\r?\n\r?\n/)) {
     const dataLines = block.split(/\r?\n/).filter((l) => l.startsWith('data:'));
     if (!dataLines.length) continue;
-    // Strip the `data:` field name and one optional leading space per line.
+    // Drop the `data:` prefix and one optional leading space from each line.
     const payload = dataLines
       .map((l) => l.slice(5).replace(/^ /, ''))
       .join('\n');
@@ -45,13 +40,11 @@ export function parseLogSse(raw: string): LogEntry[] {
   return items;
 }
 
-// Read cap for a log snapshot: how long to hold the stream open, and the byte
-// ceiling that flips `truncated`. Kept here so both log tools agree.
+// How long to hold the stream open, and the byte cap that flips `truncated`.
 export const LOG_STREAM_DEFAULT_WAIT_MS = 5000;
 export const LOG_STREAM_MAX_BYTES = 256 * 1024;
 
-// Shared Zod parameter schema for the two log tools. Spread into each
-// server.tool() registration alongside the resource id (podId / workerId).
+// Zod params shared by both log tools; spread in alongside the resource id.
 export const logStreamParams = {
   source: z
     .enum(['container', 'system', 'both'])
@@ -64,14 +57,12 @@ export const logStreamParams = {
     .max(5000)
     .optional()
     .describe(
-      'Number of historical lines to backfill before live output (API default 100, max 5000; 0 = live only). Ignored when `since` is set.'
+      'Historical lines to backfill before live output (API default 100, max 5000; 0 = live only). Ignored when `since` is set.'
     ),
   since: z
     .string()
     .optional()
-    .describe(
-      'RFC3339 timestamp to resume from. When set, the stream resumes from this point and `tail` is ignored.'
-    ),
+    .describe('RFC3339 timestamp to resume from; when set, `tail` is ignored.'),
   maxWaitMs: z
     .number()
     .int()
@@ -88,12 +79,10 @@ export interface LogStreamParams {
   maxWaitMs?: number;
 }
 
-// Bounded read of a log SSE endpoint. Builds the query string, reads up to the
-// byte/time cap via the injected `streamSse`, and returns the parsed frames.
-// `source: 'both'` (or omitted) sends NO `source` param — the wire enum is only
-// container|system, and the endpoint returns both streams when it is absent.
-// Throws HttpError on a non-OK response (the caller maps it to a JSON error
-// reply).
+// Read a bounded snapshot of a log endpoint and return the parsed frames.
+// `source: 'both'` (or omitted) sends no `source` param — the endpoint returns
+// both streams when it's absent (the wire enum is only container|system).
+// Throws HttpError on a non-OK response.
 export async function collectLogSnapshot(
   streamSse: StreamSse,
   logsUrl: string,
@@ -104,11 +93,42 @@ export async function collectLogSnapshot(
     qs.append('source', params.source);
   if (params.tail !== undefined) qs.append('tail', String(params.tail));
   if (params.since) qs.append('since', params.since);
-  const queryString = qs.toString() ? `?${qs.toString()}` : '';
-  const { raw, truncated } = await streamSse(`${logsUrl}${queryString}`, {
+  const query = qs.toString() ? `?${qs}` : '';
+  const { raw, truncated } = await streamSse(`${logsUrl}${query}`, {
     maxWaitMs: params.maxWaitMs ?? LOG_STREAM_DEFAULT_WAIT_MS,
     maxBytes: LOG_STREAM_MAX_BYTES,
   });
   const items = parseLogSse(raw);
   return { items, count: items.length, truncated };
+}
+
+// The full handler for a log tool: resolve the backend, gate v2-only, stream a
+// snapshot, and map an HTTP error to a JSON reply. `logsUrl` builds the endpoint
+// URL from the resolved backend (the resource id is closed over by the caller).
+export async function streamLogsReply(
+  rt: Pick<ToolRuntime, 'jsonReply' | 'backendFor' | 'streamSse'>,
+  tool: {
+    name: string;
+    resource: Resource;
+    logsUrl: (backend: Backend) => string;
+  },
+  params: LogStreamParams
+) {
+  const backend = rt.backendFor(tool.resource);
+  if (backend.version === 'v1') {
+    return rt.jsonReply({
+      error: `${tool.name} is only available on the v2 REST API. Set RUNPOD_REST_VERSION=v2.`,
+      status: 501,
+    });
+  }
+  try {
+    return rt.jsonReply(
+      await collectLogSnapshot(rt.streamSse, tool.logsUrl(backend), params)
+    );
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return rt.jsonReply({ error: error.message, status: error.status });
+    }
+    throw error;
+  }
 }
