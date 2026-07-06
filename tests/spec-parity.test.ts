@@ -86,6 +86,7 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   updatePod: ['update-pod'],
   deletePod: ['delete-pod'],
   podAction: ['start-pod', 'stop-pod', 'restart-pod'],
+  getPodLogs: ['stream-pod-logs'],
   // serverless endpoints
   listEndpoints: ['list-endpoints'],
   createEndpoint: ['create-endpoint'],
@@ -93,6 +94,7 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   updateEndpoint: ['update-endpoint'],
   deleteEndpoint: ['delete-endpoint'],
   listEndpointWorkers: ['list-endpoint-workers'],
+  getWorkerLogs: ['stream-worker-logs'],
   // templates
   listTemplates: ['list-templates'],
   createTemplate: ['create-template'],
@@ -134,16 +136,10 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   listClusterBilling: ['get-billing'],
 };
 
-// Spec operations we deliberately do NOT expose as a tool. The vendored spec is
-// the DEV v2 superset (47 ops); these two ops are live on dev but NOT yet on
-// prod (v2-rest.runpod.io serves 45 ops and 422s these paths). Their tools are
-// implemented but registration is COMMENTED OUT until prod ships them (see
-// src/tools/pods.ts stream-pod-logs + src/tools/endpoints.ts
-// list-endpoint-releases). Remove the entry + uncomment the tool when prod has
-// the op.
+// Spec operations we deliberately do NOT expose as a tool. Its tool is
+// implemented but registration is COMMENTED OUT (see src/tools/endpoints.ts
+// list-endpoint-releases). Remove the entry + uncomment the tool when it ships.
 const ALLOWLIST_UNMAPPED_OPS: Record<string, string> = {
-  getPodLogs:
-    'stream-pod-logs implemented but disabled — dev-only op, prod 422s GET /v2/pods/{id}/logs',
   listEndpointReleases:
     'list-endpoint-releases implemented but disabled — dev-only op, prod 422s GET /v2/serverless/{id}/releases',
 };

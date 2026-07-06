@@ -12,7 +12,7 @@ import {
   mapEndpointCreateToV2,
   mapEndpointUpdateToV2,
 } from '../src/_shared/mappers.js';
-import { parsePodLogSse } from '../src/tools/pods.js';
+import { parseLogSse } from '../src/tools/logs.js';
 
 const fixture = JSON.parse(
   readFileSync(
@@ -282,7 +282,7 @@ describe('mapEndpointUpdateToV2', () => {
   });
 });
 
-describe('parsePodLogSse', () => {
+describe('parseLogSse', () => {
   it('parses data: JSON frames separated by blank lines', () => {
     const raw = [
       'data: {"source":"container","line":"a","ts":"t1"}',
@@ -290,7 +290,7 @@ describe('parsePodLogSse', () => {
       'data: {"source":"system","line":"b","ts":"t2"}',
       '',
     ].join('\n');
-    const items = parsePodLogSse(raw);
+    const items = parseLogSse(raw);
     assert.equal(items.length, 2);
     assert.deepEqual(items[0], { source: 'container', line: 'a', ts: 't1' });
     assert.equal(items[1].line, 'b');
@@ -298,7 +298,7 @@ describe('parsePodLogSse', () => {
 
   it('handles CRLF line endings', () => {
     const raw = 'data: {"line":"x"}\r\n\r\ndata: {"line":"y"}\r\n\r\n';
-    const items = parsePodLogSse(raw);
+    const items = parseLogSse(raw);
     assert.deepEqual(
       items.map((i) => i.line),
       ['x', 'y']
@@ -307,17 +307,17 @@ describe('parsePodLogSse', () => {
 
   it('ignores comment lines and non-data fields', () => {
     const raw = ': keepalive\n\nevent: ping\nid: 5\n\ndata: {"line":"z"}\n\n';
-    const items = parsePodLogSse(raw);
+    const items = parseLogSse(raw);
     assert.equal(items.length, 1);
     assert.equal(items[0].line, 'z');
   });
 
   it('keeps non-JSON payloads verbatim under raw (never drops a line)', () => {
-    const items = parsePodLogSse('data: plain text line\n\n');
+    const items = parseLogSse('data: plain text line\n\n');
     assert.deepEqual(items, [{ raw: 'plain text line' }]);
   });
 
   it('empty stream → no items', () => {
-    assert.deepEqual(parsePodLogSse(''), []);
+    assert.deepEqual(parseLogSse(''), []);
   });
 });

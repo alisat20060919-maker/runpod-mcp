@@ -1324,8 +1324,10 @@ describe('all v2-only tools: v1 → 501 with no request', () => {
     ['detach-tag', { tagId: 't1', resourceType: 'POD', resourceId: 'p1' }],
     ['get-billing', {}],
     ['list-endpoint-workers', { endpointId: 'ep_1' }],
-    // list-endpoint-releases + stream-pod-logs are DISABLED (dev-only ops not
-    // yet on prod) — not registered, so they're out of this 501 sweep.
+    ['stream-pod-logs', { podId: 'pod_1' }],
+    ['stream-worker-logs', { endpointId: 'ep_1', workerId: 'w_1' }],
+    // list-endpoint-releases is DISABLED (dev-only op not yet on prod) — not
+    // registered, so it's out of this 501 sweep.
     ['get-cpu-type', { cpuTypeId: 'cpu5c' }],
     ['get-data-center', { dataCenterId: 'EU-RO-1' }],
     ['list-cpu-types', {}],
@@ -1543,11 +1545,90 @@ describe('endpoint routing under v1 (templateId model preserved)', () => {
   });
 });
 
-// NOTE: stream-pod-logs is implemented but its registration is DISABLED
-// (dev-only op, prod 422s GET /v2/pods/{id}/logs) — so there's no handler to
-// drive end-to-end here. The SSE frame parser (parsePodLogSse) is unit-tested in
-// mappers.test.ts; the harness retains a `streamSse` injection seam for when the
-// tool is re-enabled.
+// ============== Log streaming (stream-pod-logs / stream-worker-logs) ==========
+// Both are v2-only SSE tools. The 501-on-v1 behaviour is covered by the V2_ONLY
+// sweep above; here we drive the v2 happy path through the injected `streamSse`
+// seam (the real reader uses node-fetch directly, bypassing the fake fetch) and
+// lock the URL + query building. The frame parser is unit-tested in
+// mappers.test.ts.
+describe('log streaming tools (v2-only, SSE)', () => {
+  // A fake streamSse that records the URL it was called with and returns two
+  // canned frames plus a truncated flag.
+  function recordingStreamSse() {
+    const calls: Array<{ url: string; maxWaitMs: number; maxBytes: number }> =
+      [];
+    const streamSse = async (
+      url: string,
+      o: { maxWaitMs: number; maxBytes: number }
+    ) => {
+      calls.push({ url, ...o });
+      return {
+        raw:
+          'data: {"source":"container","line":"hello","ts":"t1"}\n\n' +
+          'data: {"source":"system","line":"up","ts":"t2"}\n\n',
+        truncated: false,
+      };
+    };
+    return { calls, streamSse };
+  }
+
+  it('stream-pod-logs → GET <v2>/v2/pods/{id}/logs, parses frames', async () => {
+    await withV2(async () => {
+      const { calls, streamSse } = recordingStreamSse();
+      const { handlers } = harness({ streamSse });
+      const out = await handlers.get('stream-pod-logs')!({ podId: 'pod_1' });
+      assert.equal(calls.length, 1);
+      // `source: both` is the default → NO source query param.
+      assert.equal(
+        calls[0].url,
+        'https://v2-rest.runpod.io/v2/pods/pod_1/logs'
+      );
+      assert.equal(calls[0].maxWaitMs, 5000);
+      assert.equal(calls[0].maxBytes, 256 * 1024);
+      const body = parseText(out);
+      assert.equal(body.count, 2);
+      assert.equal((body.items as unknown[]).length, 2);
+      assert.equal(body.truncated, false);
+    });
+  });
+
+  it('stream-pod-logs forwards source/tail/since + maxWaitMs (source=both omitted)', async () => {
+    await withV2(async () => {
+      const { calls, streamSse } = recordingStreamSse();
+      const { handlers } = harness({ streamSse });
+      await handlers.get('stream-pod-logs')!({
+        podId: 'pod_2',
+        source: 'container',
+        tail: 50,
+        since: '2026-05-01T22:00:00Z',
+        maxWaitMs: 8000,
+      });
+      assert.equal(
+        calls[0].url,
+        'https://v2-rest.runpod.io/v2/pods/pod_2/logs?source=container&tail=50&since=2026-05-01T22%3A00%3A00Z'
+      );
+      assert.equal(calls[0].maxWaitMs, 8000);
+    });
+  });
+
+  it('stream-worker-logs → GET <v2>/v2/serverless/{id}/workers/{workerId}/logs', async () => {
+    await withV2(async () => {
+      const { calls, streamSse } = recordingStreamSse();
+      const { handlers } = harness({ streamSse });
+      const out = await handlers.get('stream-worker-logs')!({
+        endpointId: 'ep_1',
+        workerId: 'w_9',
+        source: 'system',
+        tail: 0,
+      });
+      assert.equal(
+        calls[0].url,
+        'https://v2-rest.runpod.io/v2/serverless/ep_1/workers/w_9/logs?source=system&tail=0'
+      );
+      assert.equal(parseText(out).count, 2);
+    });
+  });
+});
 
 // The v1 catalog path (list-gpu-types / list-data-centers) goes through
 // `graphqlRequest`, which now uses the INJECTED fetch (not module-level

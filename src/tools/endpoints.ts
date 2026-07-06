@@ -1,7 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { capListResult, listPaginationParams } from '../pagination.js';
+import { HttpError } from '../_shared/http.js';
 import { READ_ONLY, WRITE, DESTRUCTIVE, type ToolRuntime } from './runtime.js';
+import { collectLogSnapshot, logStreamParams } from './logs.js';
 
 // ============== ENDPOINT MANAGEMENT TOOLS ==============
 // Serverless endpoint CRUD, version-aware via the backend adapter.
@@ -15,7 +17,7 @@ export function registerEndpointTools(
   server: McpServer,
   rt: ToolRuntime
 ): void {
-  const { jsonReply, callRestUrl, backendFor } = rt;
+  const { jsonReply, callRestUrl, backendFor, streamSse } = rt;
 
   // List Endpoints — v1 supports includeTemplate/includeWorkers query params;
   // v2 (GET /v2/serverless) declares none, so we only build the query under v1.
@@ -423,6 +425,49 @@ export function registerEndpointTools(
         { limit: params.limit, cursor: params.cursor },
         { summary: raw?.summary, endpointVersion: raw?.endpointVersion }
       );
+    }
+  );
+
+  // Stream Worker Logs (v2-only — GET /v2/serverless/{id}/workers/{workerId}/logs,
+  // Server-Sent Events). Same contract as stream-pod-logs (see collectLogSnapshot);
+  // returns a 501 notice on the v1 API. Get workerId from list-endpoint-workers.
+  server.tool(
+    'stream-worker-logs',
+    "Fetch a bounded snapshot of a serverless worker's live logs (container and/or system) via Server-Sent Events. v2-only — returns a 501 notice on the v1 API. Get the workerId from list-endpoint-workers. Reads for up to maxWaitMs (default 5s) and returns the collected log lines; use `tail` to backfill recent lines first. Large output is truncated (see the `truncated` flag).",
+    {
+      endpointId: z
+        .string()
+        .describe('ID of the Serverless endpoint the worker belongs to'),
+      workerId: z
+        .string()
+        .describe(
+          'ID of the worker whose logs to stream (from list-endpoint-workers)'
+        ),
+      ...logStreamParams,
+    },
+    { title: 'Stream worker logs', ...READ_ONLY },
+    async (params) => {
+      const backend = backendFor('workers');
+      if (backend.version === 'v1') {
+        return jsonReply({
+          error:
+            'stream-worker-logs is only available on the v2 REST API. Set RUNPOD_REST_VERSION=v2.',
+          status: 501,
+        });
+      }
+      try {
+        const result = await collectLogSnapshot(
+          streamSse,
+          `${backend.base}/serverless/${params.endpointId}/workers/${params.workerId}/logs`,
+          params
+        );
+        return jsonReply(result);
+      } catch (error) {
+        if (error instanceof HttpError) {
+          return jsonReply({ error: error.message, status: error.status });
+        }
+        throw error;
+      }
     }
   );
 }

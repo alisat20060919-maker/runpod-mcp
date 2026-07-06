@@ -123,9 +123,12 @@ components:
       name: product
       in: query
       required: false
-      description: "Availability product context. Valid only with include=AVAILABILITY. Supported values for CPUs: POD, SERVERLESS. Upstream default when omitted: POD."
+      description: "Comma-separated availability product context. Valid only with include=AVAILABILITY. Supported values for CPUs: POD, SERVERLESS. Defaults to POD when omitted."
       schema:
-        $ref: "#/components/schemas/CpuProduct"
+        type: array
+        items:
+          $ref: "#/components/schemas/CpuProduct"
+        example: [POD, SERVERLESS]
     CpuVCPUCountFilter:
       name: vcpuCount
       in: query
@@ -135,6 +138,50 @@ components:
         type: integer
         minimum: 2
       example: 4
+
+    LogSourceParam:
+      name: source
+      in: query
+      required: false
+      description: Log source to stream. Omit to include both container and system logs.
+      schema:
+        $ref: "#/components/schemas/LogSource"
+    LogTail:
+      name: tail
+      in: query
+      required: false
+      description: |
+        Number of historical lines to backfill before streaming. Defaults to
+        100 when omitted; set `0` to stream live with no backfill. Maximum 5000.
+        Ignored when `since` or `Last-Event-ID` is provided — the resume cursor
+        drives the backfill instead.
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 5000
+        default: 100
+    LogSince:
+      name: since
+      in: query
+      required: false
+      description: |
+        RFC3339 timestamp to resume from. Ignored when `Last-Event-ID` is
+        provided. When set, the stream resumes from this point and `tail` is
+        ignored.
+      schema:
+        type: string
+        format: date-time
+    LogLastEventID:
+      name: Last-Event-ID
+      in: header
+      required: false
+      description: |
+        SSE reconnect cursor — a timestamp emitted by this endpoint. Takes
+        precedence over `since` and `tail`: when present, the stream resumes
+        from this point. Sent automatically by EventSource on reconnect.
+      schema:
+        type: string
+        format: date-time
 
   schemas:
     # ── Shared Components ────────────────────────────────────────────────────
@@ -878,15 +925,15 @@ components:
         - restart
         - terminate
 
-    PodLogSource:
+    LogSource:
       type: string
       description: |
-        Log source to include in a pod log stream.
+        Log source to include in a log stream.
         - `container` — container stdout/stderr log stream
         - `system`    — host lifecycle/userlogs stream
       x-enum-varnames:
-        - PodLogSourceContainer
-        - PodLogSourceSystem
+        - LogSourceContainer
+        - LogSourceSystem
       enum:
         - container
         - system
@@ -1323,6 +1370,7 @@ components:
         - name
         - size
         - dataCenter
+        - type
         - tags
       properties:
         id:
@@ -1335,14 +1383,18 @@ components:
           example: my-dataset
         size:
           type: integer
-          minimum: 1
-          maximum: 4000
+          minimum: 10
+          maximum: 4096
           description: Allocated storage in GB
           example: 50
         dataCenter:
           type: string
           description: Data center location; immutable after creation
           example: EU-RO-1
+        type:
+          allOf:
+            - $ref: "#/components/schemas/VolumeType"
+          description: Storage tier of this volume. Set at creation and immutable.
         tags:
           type: array
           description: Tags attached to this network volume.
@@ -1363,8 +1415,8 @@ components:
           example: my-dataset
         size:
           type: integer
-          minimum: 1
-          maximum: 4000
+          minimum: 10
+          maximum: 4096
           description: Storage to allocate in GB
           example: 50
         dataCenter:
@@ -1372,10 +1424,23 @@ components:
           minLength: 1
           description: Data center in which to create the volume
           example: EU-RO-1
+        type:
+          allOf:
+            - $ref: "#/components/schemas/VolumeType"
+          description: |
+            Storage tier for the volume. Optional. When omitted, the volume is
+            provisioned using the requested data center's default (primary)
+            storage tier. HIGH_PERFORMANCE provisions a high-performance (HPS)
+            volume; STANDARD provisions a standard volume. A volume's tier is
+            immutable after creation.
 
     UpdateNetworkVolumeRequest:
       type: object
-      description: All fields are optional. Only provided fields are updated.
+      additionalProperties: false
+      minProperties: 1
+      description: |
+        Only the provided fields are updated. At least one field must be
+        present; an empty body is rejected.
       properties:
         name:
           type: string
@@ -1384,8 +1449,8 @@ components:
           example: renamed-volume
         size:
           type: integer
-          minimum: 1
-          maximum: 4000
+          minimum: 10
+          maximum: 4096
           description: |
             New size in GB. Must be greater than or equal to the current size —
             network volume storage cannot be reduced.
@@ -2496,45 +2561,10 @@ paths:
         browser/EventSource reconnects can resume with `Last-Event-ID`.
       tags: [Pods]
       parameters:
-        - name: source
-          in: query
-          required: false
-          description: Log source to stream. Omit to include both container and system logs.
-          schema:
-            $ref: "#/components/schemas/PodLogSource"
-        - name: tail
-          in: query
-          required: false
-          description: |
-            Number of historical lines to backfill before streaming. Defaults to
-            100 when omitted; set `0` to stream live with no backfill. Maximum 5000.
-            Ignored when `since` or `Last-Event-ID` is provided — the resume cursor
-            drives the backfill instead.
-          schema:
-            type: integer
-            minimum: 0
-            maximum: 5000
-            default: 100
-        - name: since
-          in: query
-          required: false
-          description: |
-            RFC3339 timestamp to resume from. Ignored when `Last-Event-ID` is
-            provided. When set, the stream resumes from this point and `tail` is
-            ignored.
-          schema:
-            type: string
-            format: date-time
-        - name: Last-Event-ID
-          in: header
-          required: false
-          description: |
-            SSE reconnect cursor — a timestamp emitted by this endpoint. Takes
-            precedence over `since` and `tail`: when present, the stream resumes
-            from this point. Sent automatically by EventSource on reconnect.
-          schema:
-            type: string
-            format: date-time
+        - $ref: "#/components/parameters/LogSourceParam"
+        - $ref: "#/components/parameters/LogTail"
+        - $ref: "#/components/parameters/LogSince"
+        - $ref: "#/components/parameters/LogLastEventID"
       responses:
         "200":
           description: Pod log event stream
@@ -2833,6 +2863,84 @@ paths:
                 $ref: "#/components/schemas/ListEndpointReleasesResponse"
         "404":
           description: Serverless endpoint not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        default:
+          description: Error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v2/serverless/{id}/workers/{workerId}/logs:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Serverless endpoint identifier
+        example: ep_abc123
+      - name: workerId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Worker identifier (from GET /v2/serverless/{id}/workers)
+        example: worker_abc
+    get:
+      operationId: getWorkerLogs
+      summary: Stream serverless worker logs
+      description: |
+        Streams a serverless worker's logs as Server-Sent Events. The `source`
+        query parameter selects which log source to include.
+
+        The SSE `data` payload shape is:
+        `{ "source": "container", "line": "...", "ts": "..." }`.
+        Log-event `id` values are the event `ts` timestamp so browser/EventSource
+        reconnects can resume with `Last-Event-ID`.
+      tags: [Serverless]
+      parameters:
+        - $ref: "#/components/parameters/LogSourceParam"
+        - $ref: "#/components/parameters/LogTail"
+        - $ref: "#/components/parameters/LogSince"
+        - $ref: "#/components/parameters/LogLastEventID"
+      responses:
+        "200":
+          description: Worker log event stream
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `no-cache` for SSE responses.
+            Connection:
+              schema:
+                type: string
+              description: Always `keep-alive` to hold the SSE stream open.
+            X-Accel-Buffering:
+              schema:
+                type: string
+              description: Always `no` to disable proxy buffering of the SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                properties:
+                  source:
+                    type: string
+                    enum: [container, system]
+                    example: container
+                  line:
+                    type: string
+                    example: Model loaded.
+                  ts:
+                    type: string
+                    format: date-time
+                    example: "2026-05-01T22:00:00Z"
+        "404":
+          description: Worker not found
           content:
             application/problem+json:
               schema:
