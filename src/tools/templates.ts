@@ -89,11 +89,15 @@ export function registerTemplateTools(
       dockerEntrypoint: z
         .array(z.string())
         .optional()
-        .describe('Docker entrypoint commands'),
+        .describe(
+          'Docker entrypoint commands. Note: not persisted on the v2 REST API, which has no separate entrypoint field (only a start command).'
+        ),
       dockerStartCmd: z
         .array(z.string())
         .optional()
-        .describe('Docker start commands'),
+        .describe(
+          'Container start command. On v2 this is stored as the template\'s `args` string; a multi-element array is joined with spaces (e.g. ["python","-u","app.py"] → "python -u app.py").'
+        ),
       env: z.record(z.string()).optional().describe('Environment variables'),
       containerDiskInGb: z
         .number()
@@ -142,6 +146,12 @@ export function registerTemplateTools(
       templateId: z.string().describe('ID of the template to update'),
       name: z.string().optional().describe('New name for the template'),
       imageName: z.string().optional().describe('New Docker image'),
+      dockerStartCmd: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "New container start command. On v2 stored as the template's `args` string; a multi-element array is joined with spaces."
+        ),
       ports: z.array(z.string()).optional().describe('New ports to expose'),
       env: z
         .record(z.string())

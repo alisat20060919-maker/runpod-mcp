@@ -185,6 +185,23 @@ describe('mapTemplateCreateToV2', () => {
     assert.equal(out.registry, 'cra_1');
     assert.equal('containerRegistryAuthId' in out, false);
   });
+
+  it('maps dockerStartCmd[] → args (space-joined string)', () => {
+    const out = mapTemplateCreateToV2({
+      name: 't',
+      dockerStartCmd: ['python', '-u', 'handler.py'],
+    });
+    assert.equal(out.args, 'python -u handler.py');
+    assert.equal('dockerStartCmd' in out, false);
+  });
+
+  it('empty/absent dockerStartCmd → NO args key (never overwrites with "")', () => {
+    assert.equal('args' in mapTemplateCreateToV2({ name: 't' }), false);
+    assert.equal(
+      'args' in mapTemplateCreateToV2({ name: 't', dockerStartCmd: [] }),
+      false
+    );
+  });
 });
 
 describe('mapTemplateUpdateToV2', () => {
@@ -199,6 +216,11 @@ describe('mapTemplateUpdateToV2', () => {
     const out = mapTemplateUpdateToV2({ containerRegistryAuthId: 'cra_2' });
     assert.equal(out.registry, 'cra_2');
     assert.equal('containerRegistryAuthId' in out, false);
+  });
+
+  it('maps dockerStartCmd[] → args on update too', () => {
+    const out = mapTemplateUpdateToV2({ dockerStartCmd: ['bash', 'run.sh'] });
+    assert.equal(out.args, 'bash run.sh');
   });
 });
 

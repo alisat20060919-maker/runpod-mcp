@@ -53,6 +53,14 @@ function persistentMount(
   return { persistent: { size, path } };
 }
 
+// dockerStartCmd[] → v2 ContainerConfig `args` (a single string). v2 has one
+// `args` field, so an array command is space-joined (lossy but the only mapping
+// available; there is no separate entrypoint field on v2). Empty/undefined → no
+// `args` key, so we never overwrite a template's command with "".
+function joinStartCmd(cmd?: string[]): string | undefined {
+  return cmd && cmd.length ? cmd.join(' ') : undefined;
+}
+
 // ---- ContainerConfig flatten shared by pod + template create/update ----
 function containerConfigToV2(p: {
   imageName?: string;
@@ -212,9 +220,9 @@ export function mapNetworkVolumeCreateToV2(
   });
 }
 
-// ---- Template: imageName→image, isServerless→serverless, ContainerConfig flatten,
-// drop readme/dockerEntrypoint/dockerStartCmd (no v2 equivalent; args collapse is
-// lossy — see PLAN B3, deferred to a follow-up that decides join semantics). ----
+// ---- Template: imageName→image, isServerless→serverless, dockerStartCmd→args,
+// ContainerConfig flatten. `dockerEntrypoint` and `readme` are dropped (no v2
+// equivalent — v2 ContainerConfig has only `args`, no separate entrypoint). ----
 interface V1TemplateCreate {
   name?: string;
   imageName?: string;
@@ -224,6 +232,9 @@ interface V1TemplateCreate {
   containerDiskInGb?: number;
   volumeInGb?: number;
   volumeMountPath?: string;
+  // Startup command. v2 has a single `args` string; joinStartCmd collapses the
+  // array into it (see joinStartCmd).
+  dockerStartCmd?: string[];
   // v2 CreateTemplateRequest requires `category` (CPU/NVIDIA/AMD). The v1 tool
   // has no such field; default to NVIDIA (the documented default) so the body is
   // valid, and accept an explicit override once the tool schema exposes it.
@@ -241,6 +252,7 @@ export function mapTemplateCreateToV2(
       name: params.name,
       serverless: params.isServerless,
       registry: params.containerRegistryAuthId,
+      args: joinStartCmd(params.dockerStartCmd),
     }),
     // Required by v2 — always emit, defaulting to NVIDIA.
     category: params.category ?? 'NVIDIA',
@@ -252,12 +264,13 @@ interface V1TemplateUpdate {
   imageName?: string;
   ports?: string[];
   env?: Record<string, string>;
+  dockerStartCmd?: string[];
   containerRegistryAuthId?: string;
   // readme has no v2 equivalent — dropped.
 }
 // Update has no required `category`; just flatten ContainerConfig + name. Crucial:
 // this maps imageName→image (an identity mapper would wrongly send `imageName` to
-// v2, which expects `image`).
+// v2, which expects `image`), and dockerStartCmd→args like create.
 export function mapTemplateUpdateToV2(
   params: V1TemplateUpdate
 ): Record<string, unknown> {
@@ -266,6 +279,7 @@ export function mapTemplateUpdateToV2(
     ...compact({
       name: params.name,
       registry: params.containerRegistryAuthId,
+      args: joinStartCmd(params.dockerStartCmd),
     }),
   };
 }
