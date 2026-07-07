@@ -32,7 +32,15 @@ export function parseLogSse(raw: string): LogEntry[] {
       .join('\n');
     if (!payload.trim()) continue;
     try {
-      items.push(JSON.parse(payload) as LogEntry);
+      const parsed: unknown = JSON.parse(payload);
+      // A log frame is a JSON object; a bare primitive/array/null (`data: 42`)
+      // is not a LogEntry, so keep it verbatim under `raw` rather than pushing a
+      // value that violates the LogEntry shape.
+      items.push(
+        parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as LogEntry)
+          : { raw: payload }
+      );
     } catch {
       items.push({ raw: payload });
     }
@@ -43,6 +51,72 @@ export function parseLogSse(raw: string): LogEntry[] {
 // How long to hold the stream open, and the byte cap that flips `truncated`.
 export const LOG_STREAM_DEFAULT_WAIT_MS = 5000;
 export const LOG_STREAM_MAX_BYTES = 256 * 1024;
+
+// Minimal structural shape of the fetch response the SSE reader consumes. Kept
+// deliberately narrow so both node-fetch (production) and a test fake satisfy it
+// without pulling in a full Response type.
+export interface SseResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+  body: AsyncIterable<Buffer> | null;
+}
+export type SseFetch = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; signal: AbortSignal }
+) => Promise<SseResponse>;
+
+// The real bounded SSE reader, extracted so it can be unit-tested against a mock
+// Response (production wires it to node-fetch in createToolRuntime). Time-bounded
+// by maxWaitMs (the stream may stay open to tail live output) and byte-bounded by
+// maxBytes; whichever fires first aborts and returns what was collected so far.
+// A timeout/cap abort is a NORMAL end of a bounded snapshot — whether it fires
+// while CONNECTING (thrown from the `await fetchImpl`) or mid body read, keep the
+// collected bytes rather than throwing. Only a non-OK HTTP status throws
+// (HttpError). Buffers are concatenated and decoded ONCE at the end so a UTF-8
+// char split across two network chunks is never corrupted.
+export async function readSseSnapshot(
+  fetchImpl: SseFetch,
+  url: string,
+  headers: Record<string, string>,
+  opts: { maxWaitMs: number; maxBytes: number }
+): Promise<{ raw: string; truncated: boolean }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.maxWaitMs);
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  let truncated = false;
+  try {
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new HttpError(
+        'Runpod API Error',
+        res.status,
+        await res.text().catch(() => '')
+      );
+    }
+    for await (const chunk of (res.body ?? []) as AsyncIterable<Buffer>) {
+      chunks.push(chunk);
+      bytes += chunk.length;
+      if (bytes >= opts.maxBytes) {
+        truncated = true;
+        controller.abort();
+        break;
+      }
+    }
+  } catch (err) {
+    // Abort (timeout or byte-cap) is a clean end of a bounded read — keep what we
+    // have. Anything else (incl. HttpError on a non-OK status) propagates.
+    if (!(err instanceof Error && err.name === 'AbortError')) throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+  return { raw: Buffer.concat(chunks).toString('utf8'), truncated };
+}
 
 // Zod params shared by both log tools; spread in alongside the resource id.
 export const logStreamParams = {
@@ -99,6 +173,11 @@ export async function collectLogSnapshot(
     maxBytes: LOG_STREAM_MAX_BYTES,
   });
   const items = parseLogSse(raw);
+  // A byte-cap truncation almost always slices the final frame mid-line, so the
+  // last parsed entry is a partial (typically garbage half-JSON kept under
+  // `raw`). Drop it when truncated so callers never see a corrupt trailing
+  // frame; `truncated: true` already signals output was cut.
+  if (truncated) items.pop();
   return { items, count: items.length, truncated };
 }
 
