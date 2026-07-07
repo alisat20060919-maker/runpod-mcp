@@ -222,6 +222,27 @@ describe('mapTemplateUpdateToV2', () => {
     const out = mapTemplateUpdateToV2({ dockerStartCmd: ['bash', 'run.sh'] });
     assert.equal(out.args, 'bash run.sh');
   });
+
+  it('empty/absent dockerStartCmd on update → NO args key (never clobbers the stored command with "")', () => {
+    assert.equal('args' in mapTemplateUpdateToV2({ name: 'n' }), false);
+    assert.equal(
+      'args' in mapTemplateUpdateToV2({ dockerStartCmd: [] }),
+      false
+    );
+  });
+
+  it('empty update input → empty body (no fields overwritten)', () => {
+    assert.deepEqual(mapTemplateUpdateToV2({}), {});
+  });
+
+  it('join is lossy for an arg containing spaces (sh -c collapses into tokens)', () => {
+    // ["sh","-c","echo hello world"] is meant to run one shell command, but v2
+    // has a single `args` string so the space-join destroys the grouping.
+    const out = mapTemplateUpdateToV2({
+      dockerStartCmd: ['sh', '-c', 'echo hello world'],
+    });
+    assert.equal(out.args, 'sh -c echo hello world');
+  });
 });
 
 describe('mapEndpointCreateToV2', () => {
