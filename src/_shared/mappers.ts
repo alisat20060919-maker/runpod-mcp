@@ -259,6 +259,38 @@ export function mapTemplateCreateToV2(
   };
 }
 
+// ---- Template → pod create body (client-side template-based deploy) ----
+// v2 CreatePodRequest has NO `templateId` field (a pod is created from an inline
+// ContainerConfig), so create-pod can't deploy from a template the way v1 did.
+// We bridge it on the MCP side: fetch the template (a v2 template GET returns a
+// full ContainerConfig — image, args, disk, ports, env, registry — plus a name
+// and template-only fields) and spread its container config into the pod body as
+// DEFAULTS. The caller's explicit pod params override these (the handler spreads
+// the mapped params on top). Template `mounts` is persistent-only, which is a
+// valid pod Mounts, so it carries over. `name` becomes the pod-name default.
+// Template-only fields (id, serverless, public, category) are dropped, and null
+// values (e.g. an unset `registry`) are omitted so we never send `null` for a
+// field the caller didn't ask to set.
+export function podBodyFromTemplate(
+  template: Record<string, unknown>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of [
+    'name',
+    'image',
+    'args',
+    'disk',
+    'ports',
+    'env',
+    'registry',
+    'mounts',
+  ]) {
+    const value = template[key];
+    if (value !== undefined && value !== null) out[key] = value;
+  }
+  return out;
+}
+
 interface V1TemplateUpdate {
   name?: string;
   imageName?: string;

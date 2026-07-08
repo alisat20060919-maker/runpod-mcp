@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { capListResult, listPaginationParams } from '../pagination.js';
 import { HttpError } from '../_shared/http.js';
 import { restV1Base } from '../_shared/backend.js';
+import { podBodyFromTemplate } from '../_shared/mappers.js';
 import { READ_ONLY, WRITE, DESTRUCTIVE, type ToolRuntime } from './runtime.js';
 
 // ============== POD MANAGEMENT TOOLS ==============
@@ -173,10 +174,19 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
   // Create Pod
   server.tool(
     'create-pod',
-    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). If the user does not specify an image, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
+    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its image, start command, ports, env, disk, volume, and registry credential are used as defaults, and any field you also pass explicitly overrides the template). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
     {
       name: z.string().optional().describe('Name for the pod'),
-      imageName: z.string().describe('Docker image to use'),
+      imageName: z
+        .string()
+        .optional()
+        .describe('Docker image to use. Optional when templateId is provided.'),
+      templateId: z
+        .string()
+        .optional()
+        .describe(
+          'Deploy from an existing template (see list-templates / get-template). The template supplies image, start command, ports, env, disk, volume, and registry credential; any field you also pass overrides the template value. Requires the v2 REST API. Still pass gpuTypeIds or computeType to choose the compute — a template does not pin the pod compute.'
+        ),
       computeType: z
         .enum(['GPU', 'CPU'])
         .optional()
@@ -215,6 +225,25 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
     async (params) => {
       const backend = backendFor('pods');
 
+      // Template-based deploy: v2 CreatePodRequest has no templateId, so we fetch
+      // the template and spread its container config into the body below. Only v2
+      // templates are ContainerConfig-shaped, so the path is v2-only.
+      if (params.templateId && backend.version !== 'v2') {
+        return jsonReply({
+          error:
+            'Deploying a pod from a templateId is only supported on the v2 REST API. Set RUNPOD_REST_VERSION=v2, or pass imageName instead.',
+          status: 501,
+        });
+      }
+      // Image comes from either imageName or the template; require one of them.
+      if (!params.imageName && !params.templateId) {
+        return jsonReply({
+          error:
+            'Provide imageName, or templateId to deploy from an existing template.',
+          status: 400,
+        });
+      }
+
       // Pod type is decided by STATED intent, never inferred from the absence of
       // GPU fields (absence used to silently downgrade a misspecified GPU request
       // into a CPU pod). On v2 we require an explicit, non-contradictory choice;
@@ -250,6 +279,15 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         // v2 has no CPU pods yet (AE-2991): serve a CPU pod from v1 (which supports
         // them) instead of failing, and tell the caller which API answered.
         if (wantsCpu) {
+          // CPU pods route to v1, but the template fetch/merge below is v2-only;
+          // rather than silently ignore the template, tell the caller.
+          if (params.templateId) {
+            return jsonReply({
+              error:
+                'Template-based deploy is currently supported only for GPU pods on the v2 API. Create the CPU pod with an explicit imageName instead.',
+              status: 400,
+            });
+          }
           // v1 is a passthrough (mapCreate is identity there), so the raw tool
           // params are the correct v1 body — `computeType` is a valid v1 field.
           // Wrap the call so a v1 error surfaces as a clean message, not a raw
@@ -280,7 +318,30 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         }
       }
 
-      const body = backend.mapCreate(params) as Record<string, unknown>;
+      let body = backend.mapCreate(params) as Record<string, unknown>;
+
+      // Template-based deploy (guaranteed v2 here). Fetch the template and use its
+      // container config as the base; the mapped pod params spread ON TOP so an
+      // explicitly-passed field (image, ports, disk, …) still wins.
+      if (params.templateId) {
+        const templatesBackend = backendFor('templates');
+        let template: Record<string, unknown>;
+        try {
+          template = (await callRestUrl(
+            `${templatesBackend.base}${templatesBackend.get!(params.templateId)}`
+          )) as Record<string, unknown>;
+        } catch (error) {
+          if (error instanceof HttpError) {
+            return jsonReply({
+              error: `Failed to load template ${params.templateId}: ${error.message}`,
+              status: error.status,
+            });
+          }
+          throw error;
+        }
+        body = { ...podBodyFromTemplate(template), ...body };
+      }
+
       try {
         const result = (await callRestUrl(
           `${backend.base}${backend.list}`,

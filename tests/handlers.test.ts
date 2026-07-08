@@ -599,6 +599,131 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     });
   });
 
+  // ── template-based deploy (create-pod with templateId, v2) ──────────────────
+  // v2 CreatePodRequest has no templateId, so create-pod fetches the template and
+  // spreads its container config into the pod body. First outbound call is the
+  // template GET, second is the pod POST.
+  const TEMPLATE_JSON = {
+    id: 'tpl_1',
+    name: 'pytorch-template',
+    image: 'runpod/pytorch:2.8.0',
+    args: 'python -u handler.py',
+    disk: 40,
+    ports: ['8888/http'],
+    env: { FOO: 'bar' },
+    registry: 'cra_9',
+    serverless: false,
+    category: 'NVIDIA',
+  };
+
+  it('create-pod v2 with templateId fetches the template and merges its config into the POST', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+      });
+      assert.equal(outbound.length, 2);
+      // 1) template GET
+      assert.equal(
+        outbound[0].url,
+        'https://v2-rest.runpod.io/v2/templates/tpl_1'
+      );
+      assert.equal(outbound[0].method, 'GET');
+      // 2) pod POST with the template's container config folded in
+      assert.equal(outbound[1].url, 'https://v2-rest.runpod.io/v2/pods');
+      assert.equal(outbound[1].method, 'POST');
+      const body = JSON.parse(outbound[1].body!);
+      assert.equal(body.image, 'runpod/pytorch:2.8.0');
+      assert.equal(body.args, 'python -u handler.py'); // start command survives
+      assert.equal(body.disk, 40);
+      assert.deepEqual(body.ports, ['8888/http']);
+      assert.deepEqual(body.env, { FOO: 'bar' });
+      assert.equal(body.registry, 'cra_9');
+      assert.equal(body.name, 'pytorch-template'); // pod-name default from template
+      assert.deepEqual(body.gpu, { id: 'A100' }); // caller-supplied compute
+      // template-only fields never reach the pod body
+      assert.equal('serverless' in body, false);
+      assert.equal('category' in body, false);
+      assert.equal('id' in body, false);
+    });
+  });
+
+  it('create-pod v2 explicit params override the template defaults', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+        name: 'my-pod',
+        imageName: 'my/override:latest',
+        containerDiskInGb: 100,
+      });
+      const body = JSON.parse(outbound[1].body!);
+      assert.equal(body.image, 'my/override:latest'); // caller image wins
+      assert.equal(body.name, 'my-pod'); // caller name wins
+      assert.equal(body.disk, 100); // caller disk wins
+      assert.equal(body.args, 'python -u handler.py'); // untouched template field stays
+    });
+  });
+
+  it('create-pod v2 with a bad templateId surfaces the template load error, fires no pod POST', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ status: 404, jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        templateId: 'nope',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 1); // only the failed template GET
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 404);
+      assert.match(payload.error, /Failed to load template nope/);
+    });
+  });
+
+  it('create-pod on v1 with templateId → 501, fires no request', async () => {
+    const { handlers, outbound } = harness({ jsonBody: {} });
+    const out = (await handlers.get('create-pod')!({
+      templateId: 'tpl_1',
+      gpuTypeIds: ['A100'],
+    })) as { content: Array<{ text: string }> };
+    assert.equal(outbound.length, 0);
+    const payload = JSON.parse(out.content[0].text);
+    assert.equal(payload.status, 501);
+    assert.match(payload.error, /only supported on the v2 REST API/);
+  });
+
+  it('create-pod v2 with neither imageName nor templateId → 400, no request', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 0);
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /Provide imageName, or templateId/);
+    });
+  });
+
+  it('create-pod v2 CPU + templateId → 400 (template deploy is GPU-only for now)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        computeType: 'CPU',
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 0);
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /only for GPU pods/);
+    });
+  });
+
   it('per-resource override (RUNPOD_REST_VERSION_PODS=v2) routes a handler to v2 end-to-end', () => {
     const prev = process.env.RUNPOD_REST_VERSION_PODS;
     process.env.RUNPOD_REST_VERSION_PODS = 'v2';

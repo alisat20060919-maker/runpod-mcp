@@ -11,6 +11,7 @@ import {
   mapTemplateUpdateToV2,
   mapEndpointCreateToV2,
   mapEndpointUpdateToV2,
+  podBodyFromTemplate,
 } from '../src/_shared/mappers.js';
 import { parsePodLogSse } from '../src/tools/pods.js';
 
@@ -242,6 +243,62 @@ describe('mapTemplateUpdateToV2', () => {
       dockerStartCmd: ['sh', '-c', 'echo hello world'],
     });
     assert.equal(out.args, 'sh -c echo hello world');
+  });
+});
+
+describe('podBodyFromTemplate', () => {
+  // A v2 template GET, as create-pod would fetch it.
+  const template = {
+    id: 'tpl_1',
+    name: 'pytorch-template',
+    image: 'runpod/pytorch:2.8.0',
+    args: 'python -u handler.py',
+    disk: 40,
+    ports: ['8888/http', '22/tcp'],
+    env: { FOO: 'bar' },
+    registry: 'cra_9',
+    mounts: { persistent: { size: 50, path: '/workspace' } },
+    serverless: false,
+    public: false,
+    category: 'NVIDIA',
+  };
+
+  it('picks the ContainerConfig subset + name, drops template-only fields', () => {
+    const out = podBodyFromTemplate(template);
+    assert.deepEqual(out, {
+      name: 'pytorch-template',
+      image: 'runpod/pytorch:2.8.0',
+      args: 'python -u handler.py',
+      disk: 40,
+      ports: ['8888/http', '22/tcp'],
+      env: { FOO: 'bar' },
+      registry: 'cra_9',
+      mounts: { persistent: { size: 50, path: '/workspace' } },
+    });
+    assert.equal('id' in out, false);
+    assert.equal('serverless' in out, false);
+    assert.equal('public' in out, false);
+    assert.equal('category' in out, false);
+  });
+
+  it('carries the start command (args) so a template deploy keeps its command', () => {
+    assert.equal(podBodyFromTemplate(template).args, 'python -u handler.py');
+  });
+
+  it('omits null values (e.g. an unset registry) rather than sending null', () => {
+    const out = podBodyFromTemplate({
+      name: 't',
+      image: 'i',
+      registry: null,
+      mounts: null,
+    });
+    assert.deepEqual(out, { name: 't', image: 'i' });
+    assert.equal('registry' in out, false);
+    assert.equal('mounts' in out, false);
+  });
+
+  it('keeps a falsy-but-meaningful empty args ("" = no start command)', () => {
+    assert.equal(podBodyFromTemplate({ image: 'i', args: '' }).args, '');
   });
 });
 
