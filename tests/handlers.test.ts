@@ -20,7 +20,6 @@ beforeEach(() => {
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerTools } from '../src/tools.js';
-import { HttpError } from '../src/_shared/http.js';
 
 // ============== Handler integration / outbound-request golden ==============
 // Drives the REAL registerTools against a fake McpServer (captures handlers) and
@@ -184,14 +183,17 @@ describe('outbound-request golden (v1 unchanged)', () => {
     assert.match(payload.error, /CPU pods are not yet supported/);
   });
 
-  it('create-pod non-501 errors still REJECT (catch does not over-swallow)', async () => {
+  it('create-pod non-501 HTTP errors surface as a clean {error, status} reply (no raw throw)', async () => {
+    // A 400 (capacity/validation) or 5xx must resolve to a readable reply the
+    // model can act on, not reject out of the tool.
     for (const status of [400, 500]) {
       const { handlers } = harness({ status });
-      await assert.rejects(
-        () => handlers.get('create-pod')!({ imageName: 'i' }),
-        (err: unknown) => err instanceof HttpError && err.status === status,
-        `status ${status} must propagate`
-      );
+      const out = (await handlers.get('create-pod')!({ imageName: 'i' })) as {
+        content: Array<{ text: string }>;
+      };
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, status, `status ${status} must surface`);
+      assert.match(payload.error, /Runpod API Error/);
     }
   });
 
@@ -721,6 +723,34 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       const payload = JSON.parse(out.content[0].text);
       assert.equal(payload.status, 400);
       assert.match(payload.error, /only for GPU pods/);
+    });
+  });
+
+  it('create-pod surfaces a 400 (e.g. "no instances available") as a clean reply, not a throw', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ status: 400, jsonBody: {} });
+      // Must RESOLVE (not reject) so the model sees a readable error rather than
+      // a raw thrown stack.
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'i',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /Runpod API Error/);
+    });
+  });
+
+  it('create-pod keeps the specific 501 hint when the v2 API returns 501 on a GPU create', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ status: 501, jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'i',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 501);
+      assert.match(payload.error, /CPU pods are not yet supported/);
     });
   });
 

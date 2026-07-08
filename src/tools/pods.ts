@@ -364,14 +364,21 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         }
         return jsonReply(result);
       } catch (error) {
-        // Defense for if/when the v2 CPU stub starts returning 501 directly
-        // (AE-2991): surface a clean message instead of a raw stack.
-        if (error instanceof HttpError && error.status === 501) {
-          return jsonReply({
-            error:
-              'CPU pods are not yet supported on the v2 REST API. Use a GPU pod, or create the CPU pod via the v1 API (set RUNPOD_REST_VERSION=v1).',
-            status: 501,
-          });
+        if (error instanceof HttpError) {
+          // Keep the extra-helpful hint for the v2 CPU-not-supported stub
+          // (AE-2991).
+          if (error.status === 501) {
+            return jsonReply({
+              error:
+                'CPU pods are not yet supported on the v2 REST API. Use a GPU pod, or create the CPU pod via the v1 API (set RUNPOD_REST_VERSION=v1).',
+              status: 501,
+            });
+          }
+          // Everything else the API rejects — a 400 capacity error ("no
+          // instances available"), 4xx validation, 429, 5xx — surfaces as a
+          // clean {error, status} reply the model can read and act on, instead
+          // of throwing a raw stack out of the tool.
+          return jsonReply({ error: error.message, status: error.status });
         }
         throw error;
       }
