@@ -1043,6 +1043,20 @@ describe('catalog routing (B5)', () => {
     });
   });
 
+  it('list-gpu-types v2 includeAvailability:false skips the stock lookup (no query param)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBody: { gpus: [{ id: 'a' }, { id: 'b' }] },
+      });
+      const out = (await handlers.get('list-gpu-types')!({
+        includeAvailability: false,
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/catalog/gpus');
+      // no availability data → nothing filtered out
+      assert.equal(JSON.parse(out.content[0].text).items.length, 2);
+    });
+  });
+
   it('list-gpu-types v2 leaves GPUs whose availability is unpopulated (never over-filters)', async () => {
     await withV2(async () => {
       const gpus = [

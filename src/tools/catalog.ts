@@ -14,7 +14,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   // List GPU Types
   server.tool(
     'list-gpu-types',
-    'List available GPU types with stock/pricing and capability filters (minimum VRAM, secure/community cloud, name search). Use this to discover valid gpuTypeIds before creating a pod or endpoint. Each result includes an `availability` summary (HIGH/MEDIUM/LOW/NONE); out-of-stock GPUs are hidden unless includeUnavailable is set. For per-datacenter availability (to pick a dataCenterIds), use get-gpu-type.',
+    'List available GPU types with stock/pricing and capability filters (minimum VRAM, secure/community cloud, name search). Use this to discover valid gpuTypeIds before creating a pod or endpoint. By default each result includes an `availability` summary (HIGH/MEDIUM/LOW/NONE) and out-of-stock GPUs are hidden unless includeUnavailable is set (set includeAvailability:false to skip the stock lookup). For per-datacenter availability (to pick a dataCenterIds), use get-gpu-type.',
     {
       ...listPaginationParams,
       minMemoryGb: z
@@ -41,6 +41,12 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         .describe(
           'Include GPUs that are currently out of stock. Default is false'
         ),
+      includeAvailability: z
+        .boolean()
+        .optional()
+        .describe(
+          'Request realtime stock and annotate each GPU with an availability summary (HIGH/MEDIUM/LOW/NONE). Default true. Set false to skip the availability lookup — then out-of-stock GPUs cannot be filtered.'
+        ),
     },
     { title: 'List GPU types', ...READ_ONLY },
     async (params) => {
@@ -49,9 +55,14 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         // v2 REST: GET /v2/catalog/gpus?include=AVAILABILITY → { gpus: [...] },
         // each with a top-level `availability` summary (HIGH/MEDIUM/LOW/NONE)
         // plus a per-datacenter `dataCenters` breakdown. Filters re-applied
-        // against v2 field names (memory/secure/community/name).
+        // against v2 field names (memory/secure/community/name). Availability is
+        // on by default; opt out with includeAvailability:false (then the
+        // out-of-stock filter/sort below simply no-op, since there's no data).
+        const wantAvailability = params.includeAvailability !== false;
         const raw = await callRestUrl(
-          `${backend.base}${backend.list}?include=AVAILABILITY`
+          `${backend.base}${backend.list}${
+            wantAvailability ? '?include=AVAILABILITY' : ''
+          }`
         );
         let gpus = backend.unwrap(raw) as Array<Record<string, unknown>>;
         if (params.minMemoryGb !== undefined)
