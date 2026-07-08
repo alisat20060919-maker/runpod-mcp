@@ -990,7 +990,7 @@ describe('catalog routing (B5)', () => {
       })) as { content: Array<{ text: string }> };
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus'
+        'https://v2-rest.runpod.io/v2/catalog/gpus?include=AVAILABILITY'
       );
       const payload = JSON.parse(out.content[0].text).items;
       assert.equal(payload.length, 1);
@@ -1016,16 +1016,43 @@ describe('catalog routing (B5)', () => {
     });
   });
 
-  it('list-gpu-types v2 includeUnavailable is a no-op (does not filter)', async () => {
+  it('list-gpu-types v2 hides NONE-availability GPUs by default, keeps them with includeUnavailable', async () => {
+    await withV2(async () => {
+      const gpus = [
+        { id: 'a', name: 'A', availability: 'MEDIUM' },
+        { id: 'b', name: 'B', availability: 'NONE' },
+      ];
+      // default: out-of-stock hidden
+      const def = (await harness({ jsonBody: { gpus } }).handlers.get(
+        'list-gpu-types'
+      )!({})) as { content: Array<{ text: string }> };
+      assert.deepEqual(
+        JSON.parse(def.content[0].text).items.map((g: { id: string }) => g.id),
+        ['a']
+      );
+      // includeUnavailable: both, highest stock first, per-DC breakdown stripped
+      const all = (await harness({ jsonBody: { gpus } }).handlers.get(
+        'list-gpu-types'
+      )!({ includeUnavailable: true })) as { content: Array<{ text: string }> };
+      const items = JSON.parse(all.content[0].text).items;
+      assert.deepEqual(
+        items.map((g: { id: string }) => g.id),
+        ['a', 'b']
+      );
+      assert.equal('dataCenters' in items[0], false);
+    });
+  });
+
+  it('list-gpu-types v2 leaves GPUs whose availability is unpopulated (never over-filters)', async () => {
     await withV2(async () => {
       const gpus = [
         { id: 'a', name: 'A' },
         { id: 'b', name: 'B' },
       ];
       const { handlers } = harness({ jsonBody: { gpus } });
-      const out = (await handlers.get('list-gpu-types')!({
-        includeUnavailable: false,
-      })) as { content: Array<{ text: string }> };
+      const out = (await handlers.get('list-gpu-types')!({})) as {
+        content: Array<{ text: string }>;
+      };
       assert.equal(JSON.parse(out.content[0].text).items.length, 2);
     });
   });
@@ -1124,15 +1151,30 @@ describe('catalog routing (B5)', () => {
       const out = (await handlers.get('get-gpu-type')!({
         gpuTypeId: 'a100',
       })) as { content: Array<{ text: string }> };
+      // availability is requested by default
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus/a100'
+        'https://v2-rest.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY'
       );
       // raw passthrough (no unwrap) — body preserved
       assert.deepEqual(JSON.parse(out.content[0].text), {
         id: 'a100',
         memory: 80,
       });
+    });
+  });
+
+  it('get-gpu-type v2 URL-encodes ids with spaces and can opt out of availability', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'x' } });
+      await handlers.get('get-gpu-type')!({
+        gpuTypeId: 'NVIDIA GeForce RTX 4090',
+        includeAvailability: false,
+      });
+      assert.equal(
+        outbound[0].url,
+        'https://v2-rest.runpod.io/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090'
+      );
     });
   });
 
