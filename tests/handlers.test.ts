@@ -172,7 +172,7 @@ describe('outbound-request golden (v1 unchanged)', () => {
     assert.match(payload.error, /only available on the v2 REST API/);
   });
 
-  it('create-pod 501 → clean message, resolves (does not reject)', async () => {
+  it('create-pod 501 → clean {error,status} reply, resolves (does not reject)', async () => {
     const { handlers } = harness({ status: 501 });
     // If create-pod re-threw, this await would reject and fail the test.
     const out = (await handlers.get('create-pod')!({ imageName: 'i' })) as {
@@ -180,7 +180,9 @@ describe('outbound-request golden (v1 unchanged)', () => {
     };
     const payload = JSON.parse(out.content[0].text);
     assert.equal(payload.status, 501);
-    assert.match(payload.error, /CPU pods are not yet supported/);
+    // Surfaces the API's own message, not a CPU-support mislabel.
+    assert.match(payload.error, /Runpod API Error/);
+    assert.doesNotMatch(payload.error, /CPU pods are not yet supported/);
   });
 
   it('create-pod non-501 HTTP errors surface as a clean {error, status} reply (no raw throw)', async () => {
@@ -741,7 +743,10 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     });
   });
 
-  it('create-pod keeps the specific 501 hint when the v2 API returns 501 on a GPU create', async () => {
+  it('create-pod does NOT mislabel a GPU-create 501 as a CPU-support issue', async () => {
+    // CPU pods route to v1 before the v2 POST, so a 501 on a GPU create here is
+    // an unimplemented-path error, not "CPU not supported". Surface the API's own
+    // message rather than the misleading CPU hint.
     await withV2(async () => {
       const { handlers } = harness({ status: 501, jsonBody: {} });
       const out = (await handlers.get('create-pod')!({
@@ -750,7 +755,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       })) as { content: Array<{ text: string }> };
       const payload = JSON.parse(out.content[0].text);
       assert.equal(payload.status, 501);
-      assert.match(payload.error, /CPU pods are not yet supported/);
+      assert.doesNotMatch(payload.error, /CPU pods are not yet supported/);
     });
   });
 

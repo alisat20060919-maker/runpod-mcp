@@ -339,6 +339,20 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
           }
           throw error;
         }
+        // CAVEATS (both low-risk, documented so they aren't silent):
+        //  1. podBodyFromTemplate copies the template's container config —
+        //     including a registry credential and volume mounts — verbatim into
+        //     the pod POST. create-pod's own mapper never emits a registry field,
+        //     so a template carrying a registry credential injects a shape the
+        //     normal create path doesn't produce; that exact body hasn't been
+        //     validated against the live v2 pod-create endpoint and could 422 at
+        //     deploy. Caller-passed fields still spread on top and win.
+        //  2. The template is fetched with its OWN version resolution. Under a
+        //     split override (e.g. RUNPOD_REST_VERSION_PODS=v2 +
+        //     RUNPOD_REST_VERSION_TEMPLATES=v1) the GET returns a v1 template
+        //     shape (imageName, not image), so the merged pod body has no `image`
+        //     and the POST 400/422s. Narrow — requires deliberately mixed
+        //     per-resource overrides.
         body = { ...podBodyFromTemplate(template), ...body };
       }
 
@@ -365,19 +379,16 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         return jsonReply(result);
       } catch (error) {
         if (error instanceof HttpError) {
-          // Keep the extra-helpful hint for the v2 CPU-not-supported stub
-          // (AE-2991).
-          if (error.status === 501) {
-            return jsonReply({
-              error:
-                'CPU pods are not yet supported on the v2 REST API. Use a GPU pod, or create the CPU pod via the v1 API (set RUNPOD_REST_VERSION=v1).',
-              status: 501,
-            });
-          }
-          // Everything else the API rejects — a 400 capacity error ("no
-          // instances available"), 4xx validation, 429, 5xx — surfaces as a
-          // clean {error, status} reply the model can read and act on, instead
-          // of throwing a raw stack out of the tool.
+          // Any API rejection — a 400 capacity error ("no instances available"),
+          // 4xx validation, 429, 5xx, or a 501 (not implemented) for this
+          // request — surfaces as a clean {error, status} reply carrying the
+          // API's own message, instead of throwing a raw stack out of the tool.
+          //
+          // NOTE: do NOT special-case 501 as "CPU not supported" here. CPU pods
+          // are routed to the v1 API above (they never reach this v2 POST), so a
+          // 501 at this point is a GPU request hitting an unimplemented path —
+          // labeling it a CPU-support issue would be misleading. The v2 CPU
+          // guidance lives on the CPU branch, where it's accurate.
           return jsonReply({ error: error.message, status: error.status });
         }
         throw error;
