@@ -7,8 +7,48 @@ import {
   createV2Prober,
   resolveBackend,
   wantsAutoProbe,
+  restVersionSummary,
   type Resource,
 } from '../src/_shared/backend.js';
+
+describe('restVersionSummary', () => {
+  it('echoes the global setting when set (lowercased)', () => {
+    assert.equal(
+      restVersionSummary({ RUNPOD_REST_VERSION: 'v1' }),
+      'RUNPOD_REST_VERSION=v1'
+    );
+    assert.equal(
+      restVersionSummary({ RUNPOD_REST_VERSION: 'AUTO' }),
+      'RUNPOD_REST_VERSION=auto'
+    );
+  });
+  it('reports the default when unset or empty', () => {
+    assert.equal(
+      restVersionSummary({}),
+      'RUNPOD_REST_VERSION unset (default v2)'
+    );
+    assert.equal(
+      restVersionSummary({ RUNPOD_REST_VERSION: '  ' }),
+      'RUNPOD_REST_VERSION unset (default v2)'
+    );
+  });
+  it('flags how many per-resource overrides are set', () => {
+    assert.equal(
+      restVersionSummary({
+        RUNPOD_REST_VERSION: 'v2',
+        RUNPOD_REST_VERSION_PODS: 'v1',
+        RUNPOD_REST_VERSION_ENDPOINTS: 'v1',
+      }),
+      'RUNPOD_REST_VERSION=v2, +2 per-resource'
+    );
+  });
+  it('counts overrides even when the global is unset', () => {
+    assert.equal(
+      restVersionSummary({ RUNPOD_REST_VERSION_PODS: 'v1' }),
+      'RUNPOD_REST_VERSION unset (default v2), +1 per-resource'
+    );
+  });
+});
 
 describe('wantsAutoProbe', () => {
   it('true when the global flag is auto (any case)', () => {
