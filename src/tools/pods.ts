@@ -383,7 +383,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
           name: 'stream-pod-logs',
           resource: 'pods',
           logsUrl: (backend) =>
-            `${backend.base}${backend.get!(params.podId)}/logs`,
+            `${backend.base}${backend.get!(encodeURIComponent(params.podId))}/logs`,
         },
         params
       )

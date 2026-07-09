@@ -5,6 +5,7 @@ import {
   parseLogSse,
   collectLogSnapshot,
   readSseSnapshot,
+  streamLogsReply,
   type SseFetch,
   type SseResponse,
 } from '../src/tools/logs.js';
@@ -185,6 +186,68 @@ describe('parseLogSse non-object guard', () => {
   it('a JSON object frame parses into a LogEntry as before', () => {
     assert.deepEqual(parseLogSse('data: {"line":"x","source":"container"}\n\n'), [
       { line: 'x', source: 'container' },
+    ]);
+  });
+});
+
+// ── streamLogsReply: the handler wrapper (v1 gate + HttpError mapping) ────────
+// Previously only the reader was tested; drive the full handler so the v2-only
+// gate and the HttpError → {error,status} mapping are exercised end to end.
+describe('streamLogsReply handler', () => {
+  const tool = {
+    name: 'stream-pod-logs',
+    resource: 'pods' as const,
+    logsUrl: (backend: { base: string }) => `${backend.base}/pods/p1/logs`,
+  };
+
+  function runtime(
+    backend: { version: 'v1' | 'v2'; base: string },
+    streamSse: (...a: unknown[]) => Promise<unknown>
+  ) {
+    const replies: unknown[] = [];
+    const rt = {
+      jsonReply: (obj: unknown) => {
+        replies.push(obj);
+        return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
+      },
+      backendFor: () => backend,
+      streamSse,
+    };
+    return { rt, replies };
+  }
+
+  it('v1 backend → 501 notice, never touches the stream', async () => {
+    let called = false;
+    const { rt, replies } = runtime(
+      { version: 'v1', base: 'https://v1' },
+      async () => {
+        called = true;
+        return { raw: '', truncated: false };
+      }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await streamLogsReply(rt as any, tool, {});
+    assert.equal(called, false);
+    assert.deepEqual(replies, [
+      {
+        error:
+          'stream-pod-logs is only available on the v2 REST API. Set RUNPOD_REST_VERSION=v2.',
+        status: 501,
+      },
+    ]);
+  });
+
+  it('v2 backend + HttpError from the stream → {error, status} reply, not a throw', async () => {
+    const { rt, replies } = runtime(
+      { version: 'v2', base: 'https://v2' },
+      async () => {
+        throw new HttpError('Runpod API Error', 502, 'upstream down');
+      }
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await streamLogsReply(rt as any, tool, {});
+    assert.deepEqual(replies, [
+      { error: 'Runpod API Error: 502 - upstream down', status: 502 },
     ]);
   });
 });

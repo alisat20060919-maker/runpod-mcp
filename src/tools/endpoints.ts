@@ -451,7 +451,7 @@ export function registerEndpointTools(
           name: 'stream-worker-logs',
           resource: 'workers',
           logsUrl: (backend) =>
-            `${backend.base}/serverless/${params.endpointId}/workers/${params.workerId}/logs`,
+            `${backend.base}/serverless/${encodeURIComponent(params.endpointId)}/workers/${encodeURIComponent(params.workerId)}/logs`,
         },
         params
       )

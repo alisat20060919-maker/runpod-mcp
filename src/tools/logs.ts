@@ -177,6 +177,12 @@ export async function collectLogSnapshot(
   // last parsed entry is a partial (typically garbage half-JSON kept under
   // `raw`). Drop it when truncated so callers never see a corrupt trailing
   // frame; `truncated: true` already signals output was cut.
+  //
+  // The pop is unconditional: in the rare case the cap lands exactly on a frame
+  // boundary (or the final bytes were a non-`data:` block that produced no
+  // entry), this drops one *valid* trailing line instead of a garbage one. That
+  // over-trim is acceptable — `truncated: true` already tells the caller output
+  // was cut, so losing one more line at the boundary is not misleading.
   if (truncated) items.pop();
   return { items, count: items.length, truncated };
 }
