@@ -263,7 +263,7 @@ describe('podBodyFromTemplate', () => {
     category: 'NVIDIA',
   };
 
-  it('picks the ContainerConfig subset + name, drops template-only fields', () => {
+  it('picks the ContainerConfig subset + name, drops template-only fields + registry', () => {
     const out = podBodyFromTemplate(template);
     assert.deepEqual(out, {
       name: 'pytorch-template',
@@ -272,13 +272,14 @@ describe('podBodyFromTemplate', () => {
       disk: 40,
       ports: ['8888/http', '22/tcp'],
       env: { FOO: 'bar' },
-      registry: 'cra_9',
       mounts: { persistent: { size: 50, path: '/workspace' } },
     });
     assert.equal('id' in out, false);
     assert.equal('serverless' in out, false);
     assert.equal('public' in out, false);
     assert.equal('category' in out, false);
+    // registry is intentionally NOT carried (un-overridable + unverified v2 shape)
+    assert.equal('registry' in out, false);
   });
 
   it('carries the start command (args) so a template deploy keeps its command', () => {

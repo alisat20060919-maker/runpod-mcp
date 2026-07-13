@@ -645,7 +645,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       assert.equal(body.disk, 40);
       assert.deepEqual(body.ports, ['8888/http']);
       assert.deepEqual(body.env, { FOO: 'bar' });
-      assert.equal(body.registry, 'cra_9');
+      assert.equal('registry' in body, false); // registry intentionally NOT carried from template
       assert.equal(body.name, 'pytorch-template'); // pod-name default from template
       assert.deepEqual(body.gpu, { id: 'A100' }); // caller-supplied compute
       // template-only fields never reach the pod body

@@ -263,7 +263,7 @@ export function mapTemplateCreateToV2(
 // v2 CreatePodRequest has NO `templateId` field (a pod is created from an inline
 // ContainerConfig), so create-pod can't deploy from a template the way v1 did.
 // We bridge it on the MCP side: fetch the template (a v2 template GET returns a
-// full ContainerConfig — image, args, disk, ports, env, registry — plus a name
+// full ContainerConfig — image, args, disk, ports, env (registry omitted) — plus a name
 // and template-only fields) and spread its container config into the pod body as
 // DEFAULTS. The caller's explicit pod params override these (the handler spreads
 // the mapped params on top). Template `mounts` is persistent-only, which is a
@@ -275,16 +275,13 @@ export function podBodyFromTemplate(
   template: Record<string, unknown>
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const key of [
-    'name',
-    'image',
-    'args',
-    'disk',
-    'ports',
-    'env',
-    'registry',
-    'mounts',
-  ]) {
+  // NOTE: `registry` is deliberately NOT copied. create-pod's own mapper never
+  // emits a registry field and the tool exposes no registry param, so a template
+  // credential injected here would be un-overridable and produces a pod-body shape
+  // not yet validated against the live v2 pod-create endpoint (could 422). Omit it
+  // until that shape is confirmed; a private-image template still needs the
+  // credential supplied another way for now.
+  for (const key of ['name', 'image', 'args', 'disk', 'ports', 'env', 'mounts']) {
     const value = template[key];
     if (value !== undefined && value !== null) out[key] = value;
   }

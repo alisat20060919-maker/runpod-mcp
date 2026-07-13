@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { capListResult, listPaginationParams } from '../pagination.js';
 import { HttpError } from '../_shared/http.js';
-import { restV1Base } from '../_shared/backend.js';
+import { restV1Base, restV2Base } from '../_shared/backend.js';
 import { podBodyFromTemplate } from '../_shared/mappers.js';
 import { READ_ONLY, WRITE, DESTRUCTIVE, type ToolRuntime } from './runtime.js';
 
@@ -174,7 +174,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
   // Create Pod
   server.tool(
     'create-pod',
-    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its image, start command, ports, env, disk, volume, and registry credential are used as defaults, and any field you also pass explicitly overrides the template). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
+    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its image, start command, ports, env, disk, and volume are used as defaults, and any field you also pass explicitly overrides the template; a template registry credential is NOT applied here, so a private-image template needs its credential set another way). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
     {
       name: z.string().optional().describe('Name for the pod'),
       imageName: z
@@ -324,11 +324,14 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
       // container config as the base; the mapped pod params spread ON TOP so an
       // explicitly-passed field (image, ports, disk, …) still wins.
       if (params.templateId) {
-        const templatesBackend = backendFor('templates');
+        // Fetch the template from v2 EXPLICITLY (not via backendFor('templates'),
+        // whose independent version resolution could return a v1 shape under a
+        // split override like RUNPOD_REST_VERSION_TEMPLATES=v1 → merged body with
+        // `imageName` not `image` → 422). Template deploy is v2-only, so pin v2.
         let template: Record<string, unknown>;
         try {
           template = (await callRestUrl(
-            `${templatesBackend.base}${templatesBackend.get!(params.templateId)}`
+            `${restV2Base(env)}/templates/${params.templateId}`
           )) as Record<string, unknown>;
         } catch (error) {
           if (error instanceof HttpError) {
@@ -339,20 +342,11 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
           }
           throw error;
         }
-        // CAVEATS (both low-risk, documented so they aren't silent):
-        //  1. podBodyFromTemplate copies the template's container config —
-        //     including a registry credential and volume mounts — verbatim into
-        //     the pod POST. create-pod's own mapper never emits a registry field,
-        //     so a template carrying a registry credential injects a shape the
-        //     normal create path doesn't produce; that exact body hasn't been
-        //     validated against the live v2 pod-create endpoint and could 422 at
-        //     deploy. Caller-passed fields still spread on top and win.
-        //  2. The template is fetched with its OWN version resolution. Under a
-        //     split override (e.g. RUNPOD_REST_VERSION_PODS=v2 +
-        //     RUNPOD_REST_VERSION_TEMPLATES=v1) the GET returns a v1 template
-        //     shape (imageName, not image), so the merged pod body has no `image`
-        //     and the POST 400/422s. Narrow — requires deliberately mixed
-        //     per-resource overrides.
+        // podBodyFromTemplate copies image/args/disk/ports/env/mounts as defaults;
+        // caller-passed fields spread on top and win. A template's registry
+        // credential is intentionally NOT applied here (un-overridable + unverified
+        // pod-body shape — see podBodyFromTemplate) so a private-image template
+        // needs its credential supplied another way for now.
         body = { ...podBodyFromTemplate(template), ...body };
       }
 
