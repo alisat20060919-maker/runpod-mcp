@@ -1,5 +1,5 @@
 ---
-'@runpod/mcp-server': patch
+'@runpod/mcp-server': minor
 ---
 
-create-pod template deploy: address review — do not inject a template's `registry` credential into the pod body (it was un-overridable and produced an unverified v2 pod-create shape), and fetch the template from v2 explicitly so a split per-resource version override can't yield a v1 template shape. Tool description updated to note a template registry credential is not applied.
+create-pod template deploy improvements. Added a `containerRegistryAuthId` param to `create-pod` (private-image registry credential, a valid v2 ContainerConfig field). When deploying from a `templateId`, the template's registry credential is inherited as a default so a private-image template pulls correctly, and `containerRegistryAuthId` overrides it. The template is fetched from v2 explicitly, so a split per-resource version override (e.g. templates pinned to v1) can't yield a v1-shaped template merged into a v2 pod body. Tool descriptions now state that template fields are applied whole-field as defaults (an explicitly-passed field replaces the template value rather than merging).

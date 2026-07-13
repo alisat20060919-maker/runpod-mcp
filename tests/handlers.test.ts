@@ -645,7 +645,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       assert.equal(body.disk, 40);
       assert.deepEqual(body.ports, ['8888/http']);
       assert.deepEqual(body.env, { FOO: 'bar' });
-      assert.equal('registry' in body, false); // registry intentionally NOT carried from template
+      assert.equal(body.registry, 'cra_9'); // registry inherited so private images pull
       assert.equal(body.name, 'pytorch-template'); // pod-name default from template
       assert.deepEqual(body.gpu, { id: 'A100' }); // caller-supplied compute
       // template-only fields never reach the pod body
@@ -666,11 +666,13 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
         name: 'my-pod',
         imageName: 'my/override:latest',
         containerDiskInGb: 100,
+        containerRegistryAuthId: 'cra_override',
       });
       const body = JSON.parse(outbound[1].body!);
       assert.equal(body.image, 'my/override:latest'); // caller image wins
       assert.equal(body.name, 'my-pod'); // caller name wins
       assert.equal(body.disk, 100); // caller disk wins
+      assert.equal(body.registry, 'cra_override'); // caller registry overrides template's cra_9
       assert.equal(body.args, 'python -u handler.py'); // untouched template field stays
     });
   });

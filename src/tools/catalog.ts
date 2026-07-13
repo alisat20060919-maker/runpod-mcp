@@ -53,11 +53,10 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
       const backend = backendFor('gpus');
       if (backend.version === 'v2') {
         // v2 REST: GET /v2/catalog/gpus?include=AVAILABILITY → { gpus: [...] },
-        // each with a top-level `availability` summary (HIGH/MEDIUM/LOW/NONE)
-        // plus a per-datacenter `dataCenters` breakdown. Filters re-applied
-        // against v2 field names (memory/secure/community/name). Availability is
-        // on by default; opt out with includeAvailability:false (then the
-        // out-of-stock filter/sort below simply no-op, since there's no data).
+        // each with an `availability` summary (HIGH/MEDIUM/LOW/NONE) and a
+        // per-datacenter `dataCenters` breakdown. Filters re-applied against v2
+        // field names. Opt out with includeAvailability:false (then the
+        // filter/sort below no-op, since there's no data).
         const wantAvailability = params.includeAvailability !== false;
         const raw = await callRestUrl(
           `${backend.base}${backend.list}${
@@ -83,11 +82,9 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
                 .includes(t)
           );
         }
-        // Full catalog by default — nothing hidden. Out-of-stock GPUs stay in
-        // the list (annotated availability:NONE and sorted last below) so this
-        // stays a complete discovery tool. Only opt-in (includeUnavailable:false)
-        // filters down to deployable GPUs. A GPU whose `availability` the backend
-        // didn't populate is treated as available, so the opt-in never over-filters.
+        // Full catalog by default; only includeUnavailable:false filters down to
+        // deployable GPUs. A GPU with no `availability` from the backend is
+        // treated as available, so the opt-in never over-filters.
         if (params.includeUnavailable === false)
           gpus = gpus.filter((g) => g.availability !== 'NONE');
         // Highest stock first so the best pick is at the top.
@@ -102,9 +99,8 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
             (rank[String(b.availability)] ?? 0) -
             (rank[String(a.availability)] ?? 0)
         );
-        // Drop the verbose per-datacenter breakdown from the list (30+ entries ×
-        // every GPU); keep the `availability` summary. get-gpu-type returns the
-        // full per-datacenter detail for choosing a dataCenterIds.
+        // Drop the bulky per-datacenter breakdown from the list; keep the
+        // `availability` summary. get-gpu-type returns the full detail.
         gpus = gpus.map(({ dataCenters: _dataCenters, ...rest }) => rest);
         return capListResult(gpus, {
           limit: params.limit,
@@ -315,8 +311,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         });
       }
       // GPU ids contain spaces (e.g. "NVIDIA GeForce RTX 4090"), so encode the
-      // path segment. Availability is on by default — it's the reason to fetch a
-      // single GPU (choosing a datacenter with stock).
+      // path segment. Availability on by default — it's the point of a single GPU.
       const path = backend.get!(encodeURIComponent(params.gpuTypeId));
       const query =
         params.includeAvailability === false ? '' : '?include=AVAILABILITY';

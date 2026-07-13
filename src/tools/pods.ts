@@ -174,7 +174,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
   // Create Pod
   server.tool(
     'create-pod',
-    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its image, start command, ports, env, disk, and volume are used as defaults, and any field you also pass explicitly overrides the template; a template registry credential is NOT applied here, so a private-image template needs its credential set another way). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
+    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its name, image, start command, ports, env, disk, volume, and registry credential are used as defaults, and any field you also pass explicitly replaces the template value for that field, e.g. passing env replaces the whole env set rather than merging; pass containerRegistryAuthId to override or supply a private-image credential). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
     {
       name: z.string().optional().describe('Name for the pod'),
       imageName: z
@@ -185,7 +185,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         .string()
         .optional()
         .describe(
-          'Deploy from an existing template (see list-templates / get-template). The template supplies image, start command, ports, env, disk, volume, and registry credential; any field you also pass overrides the template value. Requires the v2 REST API. Still pass gpuTypeIds or computeType to choose the compute — a template does not pin the pod compute.'
+          'Deploy from an existing template (see list-templates / get-template). The template supplies name, image, start command, ports, env, disk, volume, and registry credential as defaults; any field you also pass replaces the template value for that field (whole-field, not a merge). Override the registry credential with containerRegistryAuthId. Requires the v2 REST API. Still pass gpuTypeIds or computeType to choose the compute — a template does not pin the pod compute.'
         ),
       computeType: z
         .enum(['GPU', 'CPU'])
@@ -216,6 +216,12 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         .optional()
         .describe("Ports to expose (e.g., '8888/http', '22/tcp')"),
       env: z.record(z.string()).optional().describe('Environment variables'),
+      containerRegistryAuthId: z
+        .string()
+        .optional()
+        .describe(
+          'Container registry credential ID for pulling a private image (see list-container-registry-auths). When deploying from a templateId, this overrides the credential the template carries.'
+        ),
       dataCenterIds: z
         .array(z.string())
         .optional()
@@ -225,9 +231,9 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
     async (params) => {
       const backend = backendFor('pods');
 
-      // Template-based deploy: v2 CreatePodRequest has no templateId, so we fetch
-      // the template and spread its container config into the body below. Only v2
-      // templates are ContainerConfig-shaped, so the path is v2-only.
+      // Template deploy is v2-only: v2 CreatePodRequest has no templateId, so we
+      // fetch the template and spread its container config into the body below.
+      // Only v2 templates are ContainerConfig-shaped.
       if (params.templateId && backend.version !== 'v2') {
         return jsonReply({
           error:
@@ -342,11 +348,8 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
           }
           throw error;
         }
-        // podBodyFromTemplate copies image/args/disk/ports/env/mounts as defaults;
-        // caller-passed fields spread on top and win. A template's registry
-        // credential is intentionally NOT applied here (un-overridable + unverified
-        // pod-body shape — see podBodyFromTemplate) so a private-image template
-        // needs its credential supplied another way for now.
+        // Template config as defaults; caller-passed fields spread on top and win
+        // (including registry, overridable via containerRegistryAuthId).
         body = { ...podBodyFromTemplate(template), ...body };
       }
 
@@ -373,16 +376,12 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         return jsonReply(result);
       } catch (error) {
         if (error instanceof HttpError) {
-          // Any API rejection — a 400 capacity error ("no instances available"),
-          // 4xx validation, 429, 5xx, or a 501 (not implemented) for this
-          // request — surfaces as a clean {error, status} reply carrying the
-          // API's own message, instead of throwing a raw stack out of the tool.
+          // Surface any API rejection (4xx/429/5xx/501) as a clean {error, status}
+          // carrying the API's own message, instead of throwing a raw stack.
           //
-          // NOTE: do NOT special-case 501 as "CPU not supported" here. CPU pods
-          // are routed to the v1 API above (they never reach this v2 POST), so a
-          // 501 at this point is a GPU request hitting an unimplemented path —
-          // labeling it a CPU-support issue would be misleading. The v2 CPU
-          // guidance lives on the CPU branch, where it's accurate.
+          // Do NOT special-case 501 as "CPU not supported" here: CPU pods route to
+          // v1 above and never reach this v2 POST, so a 501 here is a GPU request
+          // hitting an unimplemented path — that CPU guidance lives on the CPU branch.
           return jsonReply({ error: error.message, status: error.status });
         }
         throw error;

@@ -91,6 +91,16 @@ describe('mapPodCreateToV2', () => {
     assert.equal('gpu' in out, false);
   });
 
+  it('maps containerRegistryAuthId → registry (private-image pull / template override)', () => {
+    const out = mapPodCreateToV2({ name: 'p', containerRegistryAuthId: 'cra_1' });
+    assert.equal(out.registry, 'cra_1');
+    assert.equal('containerRegistryAuthId' in out, false);
+  });
+
+  it('no registry key when containerRegistryAuthId absent (lets a template default survive)', () => {
+    assert.equal('registry' in mapPodCreateToV2({ name: 'p' }), false);
+  });
+
   it('drops unknown keys and undefined values', () => {
     const out = mapPodCreateToV2({
       name: 'p',
@@ -263,7 +273,7 @@ describe('podBodyFromTemplate', () => {
     category: 'NVIDIA',
   };
 
-  it('picks the ContainerConfig subset + name, drops template-only fields + registry', () => {
+  it('picks the ContainerConfig subset + name + registry, drops template-only fields', () => {
     const out = podBodyFromTemplate(template);
     assert.deepEqual(out, {
       name: 'pytorch-template',
@@ -273,13 +283,14 @@ describe('podBodyFromTemplate', () => {
       ports: ['8888/http', '22/tcp'],
       env: { FOO: 'bar' },
       mounts: { persistent: { size: 50, path: '/workspace' } },
+      // registry carried so a private-image template deploys with its credential
+      // (overridable via create-pod's containerRegistryAuthId).
+      registry: 'cra_9',
     });
     assert.equal('id' in out, false);
     assert.equal('serverless' in out, false);
     assert.equal('public' in out, false);
     assert.equal('category' in out, false);
-    // registry is intentionally NOT carried (un-overridable + unverified v2 shape)
-    assert.equal('registry' in out, false);
   });
 
   it('carries the start command (args) so a template deploy keeps its command', () => {
