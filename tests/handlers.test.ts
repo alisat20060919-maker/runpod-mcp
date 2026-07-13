@@ -1021,30 +1021,32 @@ describe('catalog routing (B5)', () => {
     });
   });
 
-  it('list-gpu-types v2 hides NONE-availability GPUs by default, keeps them with includeUnavailable', async () => {
+  it('list-gpu-types v2 shows all GPUs by default (nothing hidden), sorted highest-stock-first; includeUnavailable:false hides out-of-stock', async () => {
     await withV2(async () => {
       const gpus = [
-        { id: 'a', name: 'A', availability: 'MEDIUM' },
         { id: 'b', name: 'B', availability: 'NONE' },
+        { id: 'a', name: 'A', availability: 'MEDIUM' },
       ];
-      // default: out-of-stock hidden
+      // default: full catalog, nothing hidden, highest stock first, per-DC breakdown stripped
       const def = (await harness({ jsonBody: { gpus } }).handlers.get(
         'list-gpu-types'
       )!({})) as { content: Array<{ text: string }> };
-      assert.deepEqual(
-        JSON.parse(def.content[0].text).items.map((g: { id: string }) => g.id),
-        ['a']
-      );
-      // includeUnavailable: both, highest stock first, per-DC breakdown stripped
-      const all = (await harness({ jsonBody: { gpus } }).handlers.get(
-        'list-gpu-types'
-      )!({ includeUnavailable: true })) as { content: Array<{ text: string }> };
-      const items = JSON.parse(all.content[0].text).items;
+      const items = JSON.parse(def.content[0].text).items;
       assert.deepEqual(
         items.map((g: { id: string }) => g.id),
         ['a', 'b']
       );
       assert.equal('dataCenters' in items[0], false);
+      // includeUnavailable:false → opt in to hiding out-of-stock
+      const only = (await harness({ jsonBody: { gpus } }).handlers.get(
+        'list-gpu-types'
+      )!({ includeUnavailable: false })) as {
+        content: Array<{ text: string }>;
+      };
+      assert.deepEqual(
+        JSON.parse(only.content[0].text).items.map((g: { id: string }) => g.id),
+        ['a']
+      );
     });
   });
 

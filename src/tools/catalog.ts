@@ -14,7 +14,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   // List GPU Types
   server.tool(
     'list-gpu-types',
-    'List available GPU types with stock/pricing and capability filters (minimum VRAM, secure/community cloud, name search). Use this to discover valid gpuTypeIds before creating a pod or endpoint. By default each result includes an `availability` summary (HIGH/MEDIUM/LOW/NONE) and out-of-stock GPUs are hidden unless includeUnavailable is set (set includeAvailability:false to skip the stock lookup). For per-datacenter availability (to pick a dataCenterIds), use get-gpu-type.',
+    'List available GPU types with stock/pricing and capability filters (minimum VRAM, secure/community cloud, name search). Use this to discover valid gpuTypeIds before creating a pod or endpoint. By default the full catalog is returned: each result includes an `availability` summary (HIGH/MEDIUM/LOW/NONE) and results are sorted with the most-available GPUs first, but nothing is hidden. Set includeUnavailable:false to drop out-of-stock GPUs and list only deployable ones (set includeAvailability:false to skip the stock lookup entirely). For per-datacenter availability (to pick a dataCenterIds), use get-gpu-type.',
     {
       ...listPaginationParams,
       minMemoryGb: z
@@ -39,7 +39,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         .boolean()
         .optional()
         .describe(
-          'Include GPUs that are currently out of stock. Default is false'
+          'Out-of-stock GPUs are included by default (annotated availability:NONE and sorted last). Set false to hide them and list only currently-deployable GPUs.'
         ),
       includeAvailability: z
         .boolean()
@@ -83,10 +83,12 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
                 .includes(t)
           );
         }
-        // Realtime stock filter is now real on v2 (was a no-op). Hide GPUs with
-        // no stock by default. A GPU whose `availability` the backend didn't
-        // populate is treated as available, so this never over-filters.
-        if (!params.includeUnavailable)
+        // Full catalog by default — nothing hidden. Out-of-stock GPUs stay in
+        // the list (annotated availability:NONE and sorted last below) so this
+        // stays a complete discovery tool. Only opt-in (includeUnavailable:false)
+        // filters down to deployable GPUs. A GPU whose `availability` the backend
+        // didn't populate is treated as available, so the opt-in never over-filters.
+        if (params.includeUnavailable === false)
           gpus = gpus.filter((g) => g.availability !== 'NONE');
         // Highest stock first so the best pick is at the top.
         const rank: Record<string, number> = {
@@ -149,7 +151,8 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
 
       let gpuTypes = data.gpuTypes.filter((gpu) => gpu.id !== 'unknown');
 
-      if (!params.includeUnavailable) {
+      // Full catalog by default; opt in (includeUnavailable:false) to hide out-of-stock.
+      if (params.includeUnavailable === false) {
         gpuTypes = gpuTypes.filter(isAvailable);
       }
       if (params.minMemoryGb) {
