@@ -4,48 +4,11 @@ import { capListResult, listPaginationParams } from '../pagination.js';
 import { HttpError } from '../_shared/http.js';
 import { restV1Base } from '../_shared/backend.js';
 import { READ_ONLY, WRITE, DESTRUCTIVE, type ToolRuntime } from './runtime.js';
+import { logStreamParams, streamLogsReply } from './logs.js';
 
 // ============== POD MANAGEMENT TOOLS ==============
 
-// One parsed Server-Sent-Events log frame from GET /v2/pods/{id}/logs. The API
-// emits `data: {"source","line","ts"}` events; a frame that doesn't parse as
-// JSON is preserved verbatim under `raw` rather than dropped.
-export interface PodLogEntry {
-  source?: string;
-  line?: string;
-  ts?: string;
-  raw?: string;
-}
-
-// Parse the raw accumulated event-stream text into log entries. Pure (no I/O),
-// so the risky parsing logic is unit-tested without a network. SSE events are
-// separated by a blank line; the payload is the `data:` field (possibly spanning
-// multiple `data:` lines per the SSE spec). Non-JSON payloads fall back to
-// `{raw}`. Comment lines (`:`...) and other fields (event:/id:) are ignored.
-export function parsePodLogSse(raw: string): PodLogEntry[] {
-  const items: PodLogEntry[] = [];
-  for (const block of raw.split(/\r?\n\r?\n/)) {
-    const dataLines = block
-      .split(/\r?\n/)
-      .filter((l) => l.startsWith('data:'));
-    if (!dataLines.length) continue;
-    // Strip the `data:` field name and one optional leading space per line.
-    const payload = dataLines
-      .map((l) => l.slice(5).replace(/^ /, ''))
-      .join('\n');
-    if (!payload.trim()) continue;
-    try {
-      items.push(JSON.parse(payload) as PodLogEntry);
-    } catch {
-      items.push({ raw: payload });
-    }
-  }
-  return items;
-}
-
 export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
-  // NOTE: `streamSse` (used by the stream-pod-logs tool) is intentionally not
-  // destructured while that tool is disabled — see the commented block below.
   const { jsonReply, callRestUrl, backendFor, podAction, env } = rt;
 
   // List Pods
@@ -290,10 +253,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         // v2 accepts a single GPU type (`gpu.id`); v1's gpuTypeIds is "any of
         // these". If the caller offered several, only the first was sent — say
         // so in the reply so the narrowing isn't silent.
-        if (
-          backend.version === 'v2' &&
-          (params.gpuTypeIds?.length ?? 0) > 1
-        ) {
+        if (backend.version === 'v2' && (params.gpuTypeIds?.length ?? 0) > 1) {
           return jsonReply({
             ...result,
             _warning: `v2 accepts one GPU type per pod; used "${params.gpuTypeIds![0]}" and ignored ${
@@ -406,68 +366,28 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
     }
   );
 
-  // ⛔ DISABLED until prod ships the endpoint — DO NOT register yet.
-  // `stream-pod-logs` calls GET /v2/pods/{id}/logs (SSE). That op exists ONLY on
-  // the dev v2 deployment (v2-rest.runpod.dev, 47-op spec); prod
-  // (v2-rest.runpod.io, 45-op spec) returns 422 "path not found". Keeping the
-  // tool registered would expose a call that 422s in prod. The implementation
-  // (parsePodLogSse + the runtime streamSse reader) stays in the tree and is
-  // unit-tested; re-enable this block (and re-add `streamSse` to the destructure
-  // above) once getPodLogs is live on prod.
-  /*
+  // Stream Pod Logs (v2-only — GET /v2/pods/{id}/logs, Server-Sent Events).
+  // Stream Pod Logs (v2-only — GET /v2/pods/{id}/logs). See streamLogsReply.
   server.tool(
     'stream-pod-logs',
-    'Fetch a bounded snapshot of a pod\'s live logs (container and/or system) via Server-Sent Events. v2-only — returns a 501 notice on the v1 API. Reads for up to maxWaitMs (default 5s) and returns the collected log lines; use `tail` to backfill recent lines first. Large output is truncated (see the `truncated` flag).',
+    "Fetch a bounded snapshot of a pod's live logs (container and/or system) via Server-Sent Events. v2-only — returns a 501 notice on the v1 API. Reads for up to maxWaitMs (default 5s) and returns the collected log lines; use `tail` to backfill recent lines first. Large output is truncated (see the `truncated` flag).",
     {
       podId: z.string().describe('ID of the pod whose logs to stream'),
-      source: z
-        .enum(['container', 'system', 'both'])
-        .optional()
-        .describe('Which log source to read (default: both)'),
-      tail: z
-        .number()
-        .int()
-        .min(0)
-        .optional()
-        .describe('Number of recent lines to backfill before live output'),
-      maxWaitMs: z
-        .number()
-        .int()
-        .min(500)
-        .max(30000)
-        .optional()
-        .describe('How long to read the stream, in ms (default 5000, max 30000)'),
+      ...logStreamParams,
     },
     { title: 'Stream pod logs', ...READ_ONLY },
-    async (params) => {
-      const backend = backendFor('pods');
-      if (backend.version === 'v1') {
-        return jsonReply({
-          error:
-            'stream-pod-logs is only available on the v2 REST API. Set RUNPOD_REST_VERSION=v2.',
-          status: 501,
-        });
-      }
-      const qs = new URLSearchParams();
-      if (params.source) qs.append('source', params.source);
-      if (params.tail !== undefined) qs.append('tail', String(params.tail));
-      const queryString = qs.toString() ? `?${qs.toString()}` : '';
-      try {
-        const { raw, truncated } = await streamSse(
-          `${backend.base}${backend.get!(params.podId)}/logs${queryString}`,
-          { maxWaitMs: params.maxWaitMs ?? 5000, maxBytes: 256 * 1024 }
-        );
-        const items = parsePodLogSse(raw);
-        return jsonReply({ items, count: items.length, truncated });
-      } catch (error) {
-        if (error instanceof HttpError) {
-          return jsonReply({ error: error.message, status: error.status });
-        }
-        throw error;
-      }
-    }
+    (params) =>
+      streamLogsReply(
+        rt,
+        {
+          name: 'stream-pod-logs',
+          resource: 'pods',
+          logsUrl: (backend) =>
+            `${backend.base}${backend.get!(encodeURIComponent(params.podId))}/logs`,
+        },
+        params
+      )
   );
-  */
 
   // Delete Pod
   server.tool(

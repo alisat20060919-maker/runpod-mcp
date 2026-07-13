@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { capListResult, listPaginationParams } from '../pagination.js';
 import { READ_ONLY, WRITE, DESTRUCTIVE, type ToolRuntime } from './runtime.js';
+import { logStreamParams, streamLogsReply } from './logs.js';
 
 // ============== ENDPOINT MANAGEMENT TOOLS ==============
 // Serverless endpoint CRUD, version-aware via the backend adapter.
@@ -424,5 +425,35 @@ export function registerEndpointTools(
         { summary: raw?.summary, endpointVersion: raw?.endpointVersion }
       );
     }
+  );
+
+  // Stream Worker Logs (v2-only — GET /v2/serverless/{id}/workers/{workerId}/logs).
+  // Same feature as stream-pod-logs; see streamLogsReply.
+  server.tool(
+    'stream-worker-logs',
+    "Fetch a bounded snapshot of a serverless worker's live logs (container and/or system) via Server-Sent Events. v2-only — returns a 501 notice on the v1 API. Get the workerId from list-endpoint-workers. Reads for up to maxWaitMs (default 5s) and returns the collected log lines; use `tail` to backfill recent lines first. Large output is truncated (see the `truncated` flag).",
+    {
+      endpointId: z
+        .string()
+        .describe('ID of the Serverless endpoint the worker belongs to'),
+      workerId: z
+        .string()
+        .describe(
+          'ID of the worker whose logs to stream (from list-endpoint-workers)'
+        ),
+      ...logStreamParams,
+    },
+    { title: 'Stream worker logs', ...READ_ONLY },
+    (params) =>
+      streamLogsReply(
+        rt,
+        {
+          name: 'stream-worker-logs',
+          resource: 'workers',
+          logsUrl: (backend) =>
+            `${backend.base}/serverless/${encodeURIComponent(params.endpointId)}/workers/${encodeURIComponent(params.workerId)}/logs`,
+        },
+        params
+      )
   );
 }

@@ -157,6 +157,22 @@ export function wantsAutoProbe(env: Env): boolean {
   );
 }
 
+// Human-readable summary of how RUNPOD_REST_VERSION is configured, surfaced in
+// the MCP serverInfo version so a plain `initialize` reveals whether the server
+// is pinned to v1/v2/auto (default v2) without inspecting the deployment env.
+// Echoes the global var's value (or "unset (default v2)") and flags how many
+// per-resource overrides (RUNPOD_REST_VERSION_<RESOURCE>) are set. Pure.
+export function restVersionSummary(env: Env): string {
+  const raw = (env.RUNPOD_REST_VERSION ?? '').trim().toLowerCase();
+  const base = raw
+    ? `RUNPOD_REST_VERSION=${raw}`
+    : 'RUNPOD_REST_VERSION unset (default v2)';
+  const overrides = Object.keys(env).filter(
+    (k) => k.startsWith('RUNPOD_REST_VERSION_') && (env[k] ?? '').trim() !== ''
+  ).length;
+  return overrides > 0 ? `${base}, +${overrides} per-resource` : base;
+}
+
 // ---- A1b: the real `auto` probe (decision logic, injected fetch) ----
 // Returns an async resolver that probes once and memoizes the verdict for the
 // process. The startup wiring (stdio only) awaits this once, then passes the

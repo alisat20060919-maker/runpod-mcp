@@ -1,8 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import fetch from 'node-fetch';
 import { randomUUID } from 'node:crypto';
-import { createHttpClient, HttpError } from '../_shared/http.js';
+import { createHttpClient } from '../_shared/http.js';
 import { buildTrackingHeaders } from '../_shared/tracking.js';
+import { readSseSnapshot, type SseFetch } from './logs.js';
 import {
   resolveBackend,
   restV1Base,
@@ -301,59 +302,25 @@ export function createToolRuntime(
       restClient(url, method, body)
     );
 
-  // Bounded SSE reader for stream-pod-logs. Uses node-fetch directly (not the
-  // JSON client) so we can read the response body incrementally and stop on the
-  // byte cap or the time bound. The log stream stays open to tail live output,
-  // so a timeout-abort is a NORMAL end (return what we collected), not an error;
-  // only a non-OK HTTP status throws. Overridable via deps for offline tests.
+  // Bounded SSE reader for stream-pod-logs / stream-worker-logs. Uses node-fetch
+  // directly (not the JSON client) so the response body is read incrementally and
+  // stopped on the byte cap or the time bound. The read loop itself lives in
+  // logs.ts (readSseSnapshot) so it is unit-testable against a mock Response; here
+  // we just bind it to node-fetch + the authenticated headers. Overridable via
+  // deps for offline handler tests.
   const streamSse: StreamSse =
     deps.streamSse ??
-    (async (url, opts) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), opts.maxWaitMs);
-      try {
-        const res = await fetch(url, {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${ctx.apiKey}`,
-            Accept: 'text/event-stream',
-            ...tracking(),
-          },
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          throw new HttpError(
-            'Runpod API Error',
-            res.status,
-            await res.text().catch(() => '')
-          );
-        }
-        // Collect raw Buffers and decode ONCE at the end: avoids both a UTF-8
-        // char being split across two network chunks (per-chunk toString would
-        // corrupt it) and the O(n²) cost of re-measuring a growing string.
-        const chunks: Buffer[] = [];
-        let bytes = 0;
-        let truncated = false;
-        try {
-          for await (const chunk of res.body as AsyncIterable<Buffer>) {
-            chunks.push(chunk);
-            bytes += chunk.length;
-            if (bytes >= opts.maxBytes) {
-              truncated = true;
-              controller.abort();
-              break;
-            }
-          }
-        } catch (err) {
-          // AbortError (timeout or byte-cap abort) is the expected stream end —
-          // keep what we read. Anything else propagates.
-          if (!(err instanceof Error && err.name === 'AbortError')) throw err;
-        }
-        return { raw: Buffer.concat(chunks).toString('utf8'), truncated };
-      } finally {
-        clearTimeout(timer);
-      }
-    });
+    ((url, opts) =>
+      readSseSnapshot(
+        fetch as unknown as SseFetch,
+        url,
+        {
+          Authorization: `Bearer ${ctx.apiKey}`,
+          Accept: 'text/event-stream',
+          ...tracking(),
+        },
+        opts
+      ));
 
   const backendFor = (resource: Resource): Backend =>
     resolveBackend({
