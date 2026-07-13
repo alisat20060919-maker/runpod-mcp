@@ -64,6 +64,10 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
           }`
         );
         let gpus = backend.unwrap(raw) as Array<Record<string, unknown>>;
+        // Drop the "unknown" sentinel (matches the v1 path). It's a NONE-stock
+        // placeholder that used to be masked by the default hide; now that the
+        // full catalog shows by default it would otherwise leak into the list.
+        gpus = gpus.filter((g) => g.id !== 'unknown');
         if (params.minMemoryGb !== undefined)
           gpus = gpus.filter(
             (g) => Number(g.memory ?? 0) >= params.minMemoryGb!

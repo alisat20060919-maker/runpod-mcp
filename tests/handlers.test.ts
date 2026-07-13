@@ -1091,6 +1091,23 @@ describe('catalog routing (B5)', () => {
     });
   });
 
+  it('list-gpu-types v2 drops the "unknown" sentinel GPU (parity with v1)', async () => {
+    await withV2(async () => {
+      const gpus = [
+        { id: 'a', name: 'A', availability: 'HIGH' },
+        { id: 'unknown', name: 'unknown', availability: 'NONE' },
+      ];
+      const { handlers } = harness({ jsonBody: { gpus } });
+      const out = (await handlers.get('list-gpu-types')!({})) as {
+        content: Array<{ text: string }>;
+      };
+      assert.deepEqual(
+        JSON.parse(out.content[0].text).items.map((g: { id: string }) => g.id),
+        ['a']
+      );
+    });
+  });
+
   it('list-gpu-types v2 searchTerm matches id/name', async () => {
     await withV2(async () => {
       const gpus = [
