@@ -96,8 +96,14 @@ export function mapPodCreateToV2(params: V1PodParams): Record<string, unknown> {
     name: params.name,
     // Private-image registry credential (v2 ContainerConfig `registry`). When
     // deploying from a template, this spreads over the template's registry, so
-    // passing it overrides the inherited credential.
-    registry: params.containerRegistryAuthId,
+    // passing it overrides the inherited credential. An empty string is an
+    // explicit opt-out: emit `registry: null` (v2 accepts null) to CLEAR a
+    // template's inherited credential. Undefined is dropped by compact, so an
+    // omitted param leaves the template's registry in place.
+    registry:
+      params.containerRegistryAuthId === ''
+        ? null
+        : params.containerRegistryAuthId,
     cloud: params.cloudType,
     // v2 CreatePodRequest takes `dataCenterIds` as an ARRAY (preferred data
     // centers; omit/empty = scheduler chooses). Pass the v1 list straight

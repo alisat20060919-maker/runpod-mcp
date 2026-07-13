@@ -101,6 +101,12 @@ describe('mapPodCreateToV2', () => {
     assert.equal('registry' in mapPodCreateToV2({ name: 'p' }), false);
   });
 
+  it('empty containerRegistryAuthId → registry:null (explicit opt-out clears a template credential)', () => {
+    const out = mapPodCreateToV2({ name: 'p', containerRegistryAuthId: '' });
+    assert.equal('registry' in out, true);
+    assert.equal(out.registry, null);
+  });
+
   it('drops unknown keys and undefined values', () => {
     const out = mapPodCreateToV2({
       name: 'p',

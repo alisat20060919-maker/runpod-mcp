@@ -174,7 +174,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
   // Create Pod
   server.tool(
     'create-pod',
-    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its name, image, start command, ports, env, disk, volume, and registry credential are used as defaults, and any field you also pass explicitly replaces the template value for that field, e.g. passing env replaces the whole env set rather than merging; pass containerRegistryAuthId to override or supply a private-image credential). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
+    'Create a new GPU/CPU pod on Runpod. Pass gpuTypeIds for a GPU pod, or computeType:"CPU" for a CPU pod (CPU pods are served by the v1 API for now). Pass either imageName or templateId (templateId deploys from an existing template — its name, image, start command, ports, env, disk, volume, and registry credential are used as defaults, and any field you also pass explicitly replaces the template value for that field, e.g. passing env replaces the whole env set rather than merging; pass containerRegistryAuthId to override or supply a private-image credential, or an empty string to deploy with none). If the user specifies neither an image nor a template, recommend the "Runpod Pytorch 2.8.0" image (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404) as the default — it has the most up-to-date CUDA and PyTorch versions.',
     {
       name: z.string().optional().describe('Name for the pod'),
       imageName: z
@@ -220,7 +220,7 @@ export function registerPodTools(server: McpServer, rt: ToolRuntime): void {
         .string()
         .optional()
         .describe(
-          'Container registry credential ID for pulling a private image (see list-container-registry-auths). When deploying from a templateId, this overrides the credential the template carries.'
+          'Container registry credential ID for pulling a private image (see list-container-registry-auths). When deploying from a templateId, this overrides the credential the template carries; pass an empty string to deploy with NO credential (clears a template’s inherited registry).'
         ),
       dataCenterIds: z
         .array(z.string())

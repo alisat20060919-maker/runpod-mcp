@@ -677,6 +677,22 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     });
   });
 
+  it('create-pod v2 empty containerRegistryAuthId clears the template registry (registry:null)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+        containerRegistryAuthId: '',
+      });
+      const body = JSON.parse(outbound[1].body!);
+      // opt-out: explicit null wins over the template's cra_9 (v2 accepts null)
+      assert.equal(body.registry, null);
+    });
+  });
+
   it('create-pod v2 with a bad templateId surfaces the template load error, fires no pod POST', async () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ status: 404, jsonBody: {} });
