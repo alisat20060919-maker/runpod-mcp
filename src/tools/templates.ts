@@ -89,11 +89,15 @@ export function registerTemplateTools(
       dockerEntrypoint: z
         .array(z.string())
         .optional()
-        .describe('Docker entrypoint commands'),
+        .describe(
+          'Docker entrypoint commands. Note: not persisted on the v2 REST API, which has no separate entrypoint field (only a start command).'
+        ),
       dockerStartCmd: z
         .array(z.string())
         .optional()
-        .describe('Docker start commands'),
+        .describe(
+          'Container start command. On v2 this is stored as the template\'s `args` string; a multi-element array is joined with spaces (e.g. ["python","-u","app.py"] → "python -u app.py"). The join is lossy: an element that itself contains spaces is NOT preserved as one argument — e.g. ["sh","-c","echo hi"] becomes "sh -c echo hi", so pass a shell command as a single pre-quoted element if that distinction matters. Omit or pass an empty array to leave the command unset (never overwrites with "").'
+        ),
       env: z.record(z.string()).optional().describe('Environment variables'),
       containerDiskInGb: z
         .number()
@@ -137,11 +141,17 @@ export function registerTemplateTools(
   // Update Template
   server.tool(
     'update-template',
-    "Update a template's mutable fields (name, image, ports, env, readme). Only provided fields change.",
+    "Update a template's mutable fields (name, image, ports, env, start command, registry auth). Only provided fields change; omitted fields are left untouched.",
     {
       templateId: z.string().describe('ID of the template to update'),
       name: z.string().optional().describe('New name for the template'),
       imageName: z.string().optional().describe('New Docker image'),
+      dockerStartCmd: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "New container start command. On v2 stored as the template's `args` string; a multi-element array is joined with spaces (lossy — an element containing spaces is split into separate tokens). Note: this can only set a command, not clear one — an empty or absent array is ignored so the existing command is preserved."
+        ),
       ports: z.array(z.string()).optional().describe('New ports to expose'),
       env: z
         .record(z.string())

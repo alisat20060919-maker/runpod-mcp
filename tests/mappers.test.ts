@@ -11,6 +11,7 @@ import {
   mapTemplateUpdateToV2,
   mapEndpointCreateToV2,
   mapEndpointUpdateToV2,
+  podBodyFromTemplate,
 } from '../src/_shared/mappers.js';
 import { parseLogSse } from '../src/tools/logs.js';
 
@@ -88,6 +89,22 @@ describe('mapPodCreateToV2', () => {
   it('no gpu key when no gpuTypeIds given (translation only — gpu/cpu requirement is enforced by the tool/handler)', () => {
     const out = mapPodCreateToV2({ name: 'no-gpu' });
     assert.equal('gpu' in out, false);
+  });
+
+  it('maps containerRegistryAuthId → registry (private-image pull / template override)', () => {
+    const out = mapPodCreateToV2({ name: 'p', containerRegistryAuthId: 'cra_1' });
+    assert.equal(out.registry, 'cra_1');
+    assert.equal('containerRegistryAuthId' in out, false);
+  });
+
+  it('no registry key when containerRegistryAuthId absent (lets a template default survive)', () => {
+    assert.equal('registry' in mapPodCreateToV2({ name: 'p' }), false);
+  });
+
+  it('empty containerRegistryAuthId → registry:null (explicit opt-out clears a template credential)', () => {
+    const out = mapPodCreateToV2({ name: 'p', containerRegistryAuthId: '' });
+    assert.equal('registry' in out, true);
+    assert.equal(out.registry, null);
   });
 
   it('drops unknown keys and undefined values', () => {
@@ -185,6 +202,23 @@ describe('mapTemplateCreateToV2', () => {
     assert.equal(out.registry, 'cra_1');
     assert.equal('containerRegistryAuthId' in out, false);
   });
+
+  it('maps dockerStartCmd[] → args (space-joined string)', () => {
+    const out = mapTemplateCreateToV2({
+      name: 't',
+      dockerStartCmd: ['python', '-u', 'handler.py'],
+    });
+    assert.equal(out.args, 'python -u handler.py');
+    assert.equal('dockerStartCmd' in out, false);
+  });
+
+  it('empty/absent dockerStartCmd → NO args key (never overwrites with "")', () => {
+    assert.equal('args' in mapTemplateCreateToV2({ name: 't' }), false);
+    assert.equal(
+      'args' in mapTemplateCreateToV2({ name: 't', dockerStartCmd: [] }),
+      false
+    );
+  });
 });
 
 describe('mapTemplateUpdateToV2', () => {
@@ -199,6 +233,90 @@ describe('mapTemplateUpdateToV2', () => {
     const out = mapTemplateUpdateToV2({ containerRegistryAuthId: 'cra_2' });
     assert.equal(out.registry, 'cra_2');
     assert.equal('containerRegistryAuthId' in out, false);
+  });
+
+  it('maps dockerStartCmd[] → args on update too', () => {
+    const out = mapTemplateUpdateToV2({ dockerStartCmd: ['bash', 'run.sh'] });
+    assert.equal(out.args, 'bash run.sh');
+  });
+
+  it('empty/absent dockerStartCmd on update → NO args key (never clobbers the stored command with "")', () => {
+    assert.equal('args' in mapTemplateUpdateToV2({ name: 'n' }), false);
+    assert.equal(
+      'args' in mapTemplateUpdateToV2({ dockerStartCmd: [] }),
+      false
+    );
+  });
+
+  it('empty update input → empty body (no fields overwritten)', () => {
+    assert.deepEqual(mapTemplateUpdateToV2({}), {});
+  });
+
+  it('join is lossy for an arg containing spaces (sh -c collapses into tokens)', () => {
+    // ["sh","-c","echo hello world"] is meant to run one shell command, but v2
+    // has a single `args` string so the space-join destroys the grouping.
+    const out = mapTemplateUpdateToV2({
+      dockerStartCmd: ['sh', '-c', 'echo hello world'],
+    });
+    assert.equal(out.args, 'sh -c echo hello world');
+  });
+});
+
+describe('podBodyFromTemplate', () => {
+  // A v2 template GET, as create-pod would fetch it.
+  const template = {
+    id: 'tpl_1',
+    name: 'pytorch-template',
+    image: 'runpod/pytorch:2.8.0',
+    args: 'python -u handler.py',
+    disk: 40,
+    ports: ['8888/http', '22/tcp'],
+    env: { FOO: 'bar' },
+    registry: 'cra_9',
+    mounts: { persistent: { size: 50, path: '/workspace' } },
+    serverless: false,
+    public: false,
+    category: 'NVIDIA',
+  };
+
+  it('picks the ContainerConfig subset + name + registry, drops template-only fields', () => {
+    const out = podBodyFromTemplate(template);
+    assert.deepEqual(out, {
+      name: 'pytorch-template',
+      image: 'runpod/pytorch:2.8.0',
+      args: 'python -u handler.py',
+      disk: 40,
+      ports: ['8888/http', '22/tcp'],
+      env: { FOO: 'bar' },
+      mounts: { persistent: { size: 50, path: '/workspace' } },
+      // registry carried so a private-image template deploys with its credential
+      // (overridable via create-pod's containerRegistryAuthId).
+      registry: 'cra_9',
+    });
+    assert.equal('id' in out, false);
+    assert.equal('serverless' in out, false);
+    assert.equal('public' in out, false);
+    assert.equal('category' in out, false);
+  });
+
+  it('carries the start command (args) so a template deploy keeps its command', () => {
+    assert.equal(podBodyFromTemplate(template).args, 'python -u handler.py');
+  });
+
+  it('omits null values (e.g. an unset registry) rather than sending null', () => {
+    const out = podBodyFromTemplate({
+      name: 't',
+      image: 'i',
+      registry: null,
+      mounts: null,
+    });
+    assert.deepEqual(out, { name: 't', image: 'i' });
+    assert.equal('registry' in out, false);
+    assert.equal('mounts' in out, false);
+  });
+
+  it('keeps a falsy-but-meaningful empty args ("" = no start command)', () => {
+    assert.equal(podBodyFromTemplate({ image: 'i', args: '' }).args, '');
   });
 });
 

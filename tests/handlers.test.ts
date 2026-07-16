@@ -20,7 +20,6 @@ beforeEach(() => {
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerTools } from '../src/tools.js';
-import { HttpError } from '../src/_shared/http.js';
 
 // ============== Handler integration / outbound-request golden ==============
 // Drives the REAL registerTools against a fake McpServer (captures handlers) and
@@ -173,7 +172,7 @@ describe('outbound-request golden (v1 unchanged)', () => {
     assert.match(payload.error, /only available on the v2 REST API/);
   });
 
-  it('create-pod 501 → clean message, resolves (does not reject)', async () => {
+  it('create-pod 501 → clean {error,status} reply, resolves (does not reject)', async () => {
     const { handlers } = harness({ status: 501 });
     // If create-pod re-threw, this await would reject and fail the test.
     const out = (await handlers.get('create-pod')!({ imageName: 'i' })) as {
@@ -181,17 +180,22 @@ describe('outbound-request golden (v1 unchanged)', () => {
     };
     const payload = JSON.parse(out.content[0].text);
     assert.equal(payload.status, 501);
-    assert.match(payload.error, /CPU pods are not yet supported/);
+    // Surfaces the API's own message, not a CPU-support mislabel.
+    assert.match(payload.error, /Runpod API Error/);
+    assert.doesNotMatch(payload.error, /CPU pods are not yet supported/);
   });
 
-  it('create-pod non-501 errors still REJECT (catch does not over-swallow)', async () => {
+  it('create-pod non-501 HTTP errors surface as a clean {error, status} reply (no raw throw)', async () => {
+    // A 400 (capacity/validation) or 5xx must resolve to a readable reply the
+    // model can act on, not reject out of the tool.
     for (const status of [400, 500]) {
       const { handlers } = harness({ status });
-      await assert.rejects(
-        () => handlers.get('create-pod')!({ imageName: 'i' }),
-        (err: unknown) => err instanceof HttpError && err.status === status,
-        `status ${status} must propagate`
-      );
+      const out = (await handlers.get('create-pod')!({ imageName: 'i' })) as {
+        content: Array<{ text: string }>;
+      };
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, status, `status ${status} must surface`);
+      assert.match(payload.error, /Runpod API Error/);
     }
   });
 
@@ -599,6 +603,180 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     });
   });
 
+  // ── template-based deploy (create-pod with templateId, v2) ──────────────────
+  // v2 CreatePodRequest has no templateId, so create-pod fetches the template and
+  // spreads its container config into the pod body. First outbound call is the
+  // template GET, second is the pod POST.
+  const TEMPLATE_JSON = {
+    id: 'tpl_1',
+    name: 'pytorch-template',
+    image: 'runpod/pytorch:2.8.0',
+    args: 'python -u handler.py',
+    disk: 40,
+    ports: ['8888/http'],
+    env: { FOO: 'bar' },
+    registry: 'cra_9',
+    serverless: false,
+    category: 'NVIDIA',
+  };
+
+  it('create-pod v2 with templateId fetches the template and merges its config into the POST', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+      });
+      assert.equal(outbound.length, 2);
+      // 1) template GET
+      assert.equal(
+        outbound[0].url,
+        'https://v2-rest.runpod.io/v2/templates/tpl_1'
+      );
+      assert.equal(outbound[0].method, 'GET');
+      // 2) pod POST with the template's container config folded in
+      assert.equal(outbound[1].url, 'https://v2-rest.runpod.io/v2/pods');
+      assert.equal(outbound[1].method, 'POST');
+      const body = JSON.parse(outbound[1].body!);
+      assert.equal(body.image, 'runpod/pytorch:2.8.0');
+      assert.equal(body.args, 'python -u handler.py'); // start command survives
+      assert.equal(body.disk, 40);
+      assert.deepEqual(body.ports, ['8888/http']);
+      assert.deepEqual(body.env, { FOO: 'bar' });
+      assert.equal(body.registry, 'cra_9'); // registry inherited so private images pull
+      assert.equal(body.name, 'pytorch-template'); // pod-name default from template
+      assert.deepEqual(body.gpu, { id: 'A100' }); // caller-supplied compute
+      // template-only fields never reach the pod body
+      assert.equal('serverless' in body, false);
+      assert.equal('category' in body, false);
+      assert.equal('id' in body, false);
+    });
+  });
+
+  it('create-pod v2 explicit params override the template defaults', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+        name: 'my-pod',
+        imageName: 'my/override:latest',
+        containerDiskInGb: 100,
+        containerRegistryAuthId: 'cra_override',
+      });
+      const body = JSON.parse(outbound[1].body!);
+      assert.equal(body.image, 'my/override:latest'); // caller image wins
+      assert.equal(body.name, 'my-pod'); // caller name wins
+      assert.equal(body.disk, 100); // caller disk wins
+      assert.equal(body.registry, 'cra_override'); // caller registry overrides template's cra_9
+      assert.equal(body.args, 'python -u handler.py'); // untouched template field stays
+    });
+  });
+
+  it('create-pod v2 empty containerRegistryAuthId clears the template registry (registry:null)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+        containerRegistryAuthId: '',
+      });
+      const body = JSON.parse(outbound[1].body!);
+      // opt-out: explicit null wins over the template's cra_9 (v2 accepts null)
+      assert.equal(body.registry, null);
+    });
+  });
+
+  it('create-pod v2 with a bad templateId surfaces the template load error, fires no pod POST', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ status: 404, jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        templateId: 'nope',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 1); // only the failed template GET
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 404);
+      assert.match(payload.error, /Failed to load template nope/);
+    });
+  });
+
+  it('create-pod on v1 with templateId → 501, fires no request', async () => {
+    const { handlers, outbound } = harness({ jsonBody: {} });
+    const out = (await handlers.get('create-pod')!({
+      templateId: 'tpl_1',
+      gpuTypeIds: ['A100'],
+    })) as { content: Array<{ text: string }> };
+    assert.equal(outbound.length, 0);
+    const payload = JSON.parse(out.content[0].text);
+    assert.equal(payload.status, 501);
+    assert.match(payload.error, /only supported on the v2 REST API/);
+  });
+
+  it('create-pod v2 with neither imageName nor templateId → 400, no request', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 0);
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /Provide imageName, or templateId/);
+    });
+  });
+
+  it('create-pod v2 CPU + templateId → 400 (template deploy is GPU-only for now)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        computeType: 'CPU',
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 0);
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /only for GPU pods/);
+    });
+  });
+
+  it('create-pod surfaces a 400 (e.g. "no instances available") as a clean reply, not a throw', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ status: 400, jsonBody: {} });
+      // Must RESOLVE (not reject) so the model sees a readable error rather than
+      // a raw thrown stack.
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'i',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /Runpod API Error/);
+    });
+  });
+
+  it('create-pod does NOT mislabel a GPU-create 501 as a CPU-support issue', async () => {
+    // CPU pods route to v1 before the v2 POST, so a 501 on a GPU create here is
+    // an unimplemented-path error, not "CPU not supported". Surface the API's own
+    // message rather than the misleading CPU hint.
+    await withV2(async () => {
+      const { handlers } = harness({ status: 501, jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'i',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 501);
+      assert.doesNotMatch(payload.error, /CPU pods are not yet supported/);
+    });
+  });
+
   it('per-resource override (RUNPOD_REST_VERSION_PODS=v2) routes a handler to v2 end-to-end', () => {
     const prev = process.env.RUNPOD_REST_VERSION_PODS;
     process.env.RUNPOD_REST_VERSION_PODS = 'v2';
@@ -835,7 +1013,7 @@ describe('catalog routing (B5)', () => {
       })) as { content: Array<{ text: string }> };
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus'
+        'https://v2-rest.runpod.io/v2/catalog/gpus?include=AVAILABILITY'
       );
       const payload = JSON.parse(out.content[0].text).items;
       assert.equal(payload.length, 1);
@@ -861,16 +1039,59 @@ describe('catalog routing (B5)', () => {
     });
   });
 
-  it('list-gpu-types v2 includeUnavailable is a no-op (does not filter)', async () => {
+  it('list-gpu-types v2 shows all GPUs by default (nothing hidden), sorted highest-stock-first; includeUnavailable:false hides out-of-stock', async () => {
+    await withV2(async () => {
+      const gpus = [
+        { id: 'b', name: 'B', availability: 'NONE' },
+        { id: 'a', name: 'A', availability: 'MEDIUM' },
+      ];
+      // default: full catalog, nothing hidden, highest stock first, per-DC breakdown stripped
+      const def = (await harness({ jsonBody: { gpus } }).handlers.get(
+        'list-gpu-types'
+      )!({})) as { content: Array<{ text: string }> };
+      const items = JSON.parse(def.content[0].text).items;
+      assert.deepEqual(
+        items.map((g: { id: string }) => g.id),
+        ['a', 'b']
+      );
+      assert.equal('dataCenters' in items[0], false);
+      // includeUnavailable:false → opt in to hiding out-of-stock
+      const only = (await harness({ jsonBody: { gpus } }).handlers.get(
+        'list-gpu-types'
+      )!({ includeUnavailable: false })) as {
+        content: Array<{ text: string }>;
+      };
+      assert.deepEqual(
+        JSON.parse(only.content[0].text).items.map((g: { id: string }) => g.id),
+        ['a']
+      );
+    });
+  });
+
+  it('list-gpu-types v2 includeAvailability:false skips the stock lookup (no query param)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBody: { gpus: [{ id: 'a' }, { id: 'b' }] },
+      });
+      const out = (await handlers.get('list-gpu-types')!({
+        includeAvailability: false,
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/catalog/gpus');
+      // no availability data → nothing filtered out
+      assert.equal(JSON.parse(out.content[0].text).items.length, 2);
+    });
+  });
+
+  it('list-gpu-types v2 leaves GPUs whose availability is unpopulated (never over-filters)', async () => {
     await withV2(async () => {
       const gpus = [
         { id: 'a', name: 'A' },
         { id: 'b', name: 'B' },
       ];
       const { handlers } = harness({ jsonBody: { gpus } });
-      const out = (await handlers.get('list-gpu-types')!({
-        includeUnavailable: false,
-      })) as { content: Array<{ text: string }> };
+      const out = (await handlers.get('list-gpu-types')!({})) as {
+        content: Array<{ text: string }>;
+      };
       assert.equal(JSON.parse(out.content[0].text).items.length, 2);
     });
   });
@@ -883,6 +1104,23 @@ describe('catalog routing (B5)', () => {
         content: Array<{ text: string }>;
       };
       assert.equal(JSON.parse(out.content[0].text).items.length, 3);
+    });
+  });
+
+  it('list-gpu-types v2 drops the "unknown" sentinel GPU (parity with v1)', async () => {
+    await withV2(async () => {
+      const gpus = [
+        { id: 'a', name: 'A', availability: 'HIGH' },
+        { id: 'unknown', name: 'unknown', availability: 'NONE' },
+      ];
+      const { handlers } = harness({ jsonBody: { gpus } });
+      const out = (await handlers.get('list-gpu-types')!({})) as {
+        content: Array<{ text: string }>;
+      };
+      assert.deepEqual(
+        JSON.parse(out.content[0].text).items.map((g: { id: string }) => g.id),
+        ['a']
+      );
     });
   });
 
@@ -969,15 +1207,30 @@ describe('catalog routing (B5)', () => {
       const out = (await handlers.get('get-gpu-type')!({
         gpuTypeId: 'a100',
       })) as { content: Array<{ text: string }> };
+      // availability is requested by default
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus/a100'
+        'https://v2-rest.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY'
       );
       // raw passthrough (no unwrap) — body preserved
       assert.deepEqual(JSON.parse(out.content[0].text), {
         id: 'a100',
         memory: 80,
       });
+    });
+  });
+
+  it('get-gpu-type v2 URL-encodes ids with spaces and can opt out of availability', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'x' } });
+      await handlers.get('get-gpu-type')!({
+        gpuTypeId: 'NVIDIA GeForce RTX 4090',
+        includeAvailability: false,
+      });
+      assert.equal(
+        outbound[0].url,
+        'https://v2-rest.runpod.io/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090'
+      );
     });
   });
 

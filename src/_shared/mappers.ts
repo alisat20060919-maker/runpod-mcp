@@ -26,6 +26,7 @@ interface V1PodParams {
   ports?: string[];
   env?: Record<string, string>;
   dataCenterIds?: string[];
+  containerRegistryAuthId?: string;
 }
 
 // Drop undefined entries so we never emit explicit `undefined`/`null` the API
@@ -51,6 +52,12 @@ function persistentMount(
 ): PersistentMount | undefined {
   if (size === undefined || path === undefined) return undefined;
   return { persistent: { size, path } };
+}
+
+// dockerStartCmd[] → v2 `args` (single string). Space-joined (lossy, but v2 has
+// only `args`). Empty/undefined → no `args` key, so we never overwrite with "".
+function joinStartCmd(cmd?: string[]): string | undefined {
+  return cmd && cmd.length ? cmd.join(' ') : undefined;
 }
 
 // ---- ContainerConfig flatten shared by pod + template create/update ----
@@ -87,6 +94,16 @@ export function mapPodCreateToV2(params: V1PodParams): Record<string, unknown> {
   return compact({
     ...containerConfigToV2(params),
     name: params.name,
+    // Private-image registry credential (v2 ContainerConfig `registry`). When
+    // deploying from a template, this spreads over the template's registry, so
+    // passing it overrides the inherited credential. An empty string is an
+    // explicit opt-out: emit `registry: null` (v2 accepts null) to CLEAR a
+    // template's inherited credential. Undefined is dropped by compact, so an
+    // omitted param leaves the template's registry in place.
+    registry:
+      params.containerRegistryAuthId === ''
+        ? null
+        : params.containerRegistryAuthId,
     cloud: params.cloudType,
     // v2 CreatePodRequest takes `dataCenterIds` as an ARRAY (preferred data
     // centers; omit/empty = scheduler chooses). Pass the v1 list straight
@@ -212,9 +229,9 @@ export function mapNetworkVolumeCreateToV2(
   });
 }
 
-// ---- Template: imageName→image, isServerless→serverless, ContainerConfig flatten,
-// drop readme/dockerEntrypoint/dockerStartCmd (no v2 equivalent; args collapse is
-// lossy — see PLAN B3, deferred to a follow-up that decides join semantics). ----
+// ---- Template: imageName→image, isServerless→serverless, dockerStartCmd→args,
+// ContainerConfig flatten. `dockerEntrypoint` and `readme` are dropped (no v2
+// equivalent — v2 ContainerConfig has only `args`, no separate entrypoint). ----
 interface V1TemplateCreate {
   name?: string;
   imageName?: string;
@@ -224,6 +241,8 @@ interface V1TemplateCreate {
   containerDiskInGb?: number;
   volumeInGb?: number;
   volumeMountPath?: string;
+  // Startup command; joinStartCmd collapses the array into v2's `args` string.
+  dockerStartCmd?: string[];
   // v2 CreateTemplateRequest requires `category` (CPU/NVIDIA/AMD). The v1 tool
   // has no such field; default to NVIDIA (the documented default) so the body is
   // valid, and accept an explicit override once the tool schema exposes it.
@@ -241,10 +260,31 @@ export function mapTemplateCreateToV2(
       name: params.name,
       serverless: params.isServerless,
       registry: params.containerRegistryAuthId,
+      args: joinStartCmd(params.dockerStartCmd),
     }),
     // Required by v2 — always emit, defaulting to NVIDIA.
     category: params.category ?? 'NVIDIA',
   };
+}
+
+// ---- Template → pod create body (client-side template-based deploy) ----
+// v2 CreatePodRequest has no `templateId`, so create-pod can't deploy from a
+// template the way v1 did. Bridge on the MCP side: copy the template's container
+// config into the pod body as DEFAULTS; the caller's explicit params override
+// them. `registry` is included so a private-image template deploys with its
+// credential — the caller can override it via create-pod's containerRegistryAuthId
+// param. Template-only fields (id, serverless, public, category) and null values
+// are dropped.
+export function podBodyFromTemplate(
+  template: Record<string, unknown>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const keys = ['name', 'image', 'args', 'disk', 'ports', 'env', 'mounts', 'registry'];
+  for (const key of keys) {
+    const value = template[key];
+    if (value !== undefined && value !== null) out[key] = value;
+  }
+  return out;
 }
 
 interface V1TemplateUpdate {
@@ -252,12 +292,12 @@ interface V1TemplateUpdate {
   imageName?: string;
   ports?: string[];
   env?: Record<string, string>;
+  dockerStartCmd?: string[];
   containerRegistryAuthId?: string;
   // readme has no v2 equivalent — dropped.
 }
-// Update has no required `category`; just flatten ContainerConfig + name. Crucial:
-// this maps imageName→image (an identity mapper would wrongly send `imageName` to
-// v2, which expects `image`).
+// Update has no required `category`; flatten ContainerConfig + name. Maps
+// imageName→image (v2 expects `image`) and dockerStartCmd→args like create.
 export function mapTemplateUpdateToV2(
   params: V1TemplateUpdate
 ): Record<string, unknown> {
@@ -266,6 +306,7 @@ export function mapTemplateUpdateToV2(
     ...compact({
       name: params.name,
       registry: params.containerRegistryAuthId,
+      args: joinStartCmd(params.dockerStartCmd),
     }),
   };
 }

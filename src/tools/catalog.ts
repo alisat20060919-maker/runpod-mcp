@@ -14,7 +14,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   // List GPU Types
   server.tool(
     'list-gpu-types',
-    'List available GPU types with stock/pricing and capability filters (minimum VRAM, secure/community cloud, name search). Use this to discover valid gpuTypeIds before creating a pod or endpoint. On v2 the realtime stock filter is a no-op.',
+    'List available GPU types with stock/pricing and capability filters (minimum VRAM, secure/community cloud, name search). Use this to discover valid gpuTypeIds before creating a pod or endpoint. By default the full catalog is returned: each result includes an `availability` summary (HIGH/MEDIUM/LOW/NONE) and results are sorted with the most-available GPUs first, but nothing is hidden. Set includeUnavailable:false to drop out-of-stock GPUs and list only deployable ones (set includeAvailability:false to skip the stock lookup entirely). For per-datacenter availability (to pick a dataCenterIds), use get-gpu-type.',
     {
       ...listPaginationParams,
       minMemoryGb: z
@@ -39,18 +39,35 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         .boolean()
         .optional()
         .describe(
-          'Include GPUs that are currently out of stock. Default is false'
+          'Out-of-stock GPUs are included by default (annotated availability:NONE and sorted last). Set false to hide them and list only currently-deployable GPUs.'
+        ),
+      includeAvailability: z
+        .boolean()
+        .optional()
+        .describe(
+          'Request realtime stock and annotate each GPU with an availability summary (HIGH/MEDIUM/LOW/NONE). Default true. Set false to skip the availability lookup — then out-of-stock GPUs cannot be filtered.'
         ),
     },
     { title: 'List GPU types', ...READ_ONLY },
     async (params) => {
       const backend = backendFor('gpus');
       if (backend.version === 'v2') {
-        // v2 REST: GET /v2/catalog/gpus → { gpus: [...] }. Filters re-applied
-        // against v2 field names (memory/secure/community/name). v2 has no
-        // realtime stockStatus, so `includeUnavailable` is a documented no-op.
-        const raw = await callRestUrl(`${backend.base}${backend.list}`);
+        // v2 REST: GET /v2/catalog/gpus?include=AVAILABILITY → { gpus: [...] },
+        // each with an `availability` summary (HIGH/MEDIUM/LOW/NONE) and a
+        // per-datacenter `dataCenters` breakdown. Filters re-applied against v2
+        // field names. Opt out with includeAvailability:false (then the
+        // filter/sort below no-op, since there's no data).
+        const wantAvailability = params.includeAvailability !== false;
+        const raw = await callRestUrl(
+          `${backend.base}${backend.list}${
+            wantAvailability ? '?include=AVAILABILITY' : ''
+          }`
+        );
         let gpus = backend.unwrap(raw) as Array<Record<string, unknown>>;
+        // Drop the "unknown" sentinel (matches the v1 path). It's a NONE-stock
+        // placeholder that used to be masked by the default hide; now that the
+        // full catalog shows by default it would otherwise leak into the list.
+        gpus = gpus.filter((g) => g.id !== 'unknown');
         if (params.minMemoryGb !== undefined)
           gpus = gpus.filter(
             (g) => Number(g.memory ?? 0) >= params.minMemoryGb!
@@ -69,6 +86,26 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
                 .includes(t)
           );
         }
+        // Full catalog by default; only includeUnavailable:false filters down to
+        // deployable GPUs. A GPU with no `availability` from the backend is
+        // treated as available, so the opt-in never over-filters.
+        if (params.includeUnavailable === false)
+          gpus = gpus.filter((g) => g.availability !== 'NONE');
+        // Highest stock first so the best pick is at the top.
+        const rank: Record<string, number> = {
+          HIGH: 3,
+          MEDIUM: 2,
+          LOW: 1,
+          NONE: 0,
+        };
+        gpus.sort(
+          (a, b) =>
+            (rank[String(b.availability)] ?? 0) -
+            (rank[String(a.availability)] ?? 0)
+        );
+        // Drop the bulky per-datacenter breakdown from the list; keep the
+        // `availability` summary. get-gpu-type returns the full detail.
+        gpus = gpus.map(({ dataCenters: _dataCenters, ...rest }) => rest);
         return capListResult(gpus, {
           limit: params.limit,
           cursor: params.cursor,
@@ -114,7 +151,8 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
 
       let gpuTypes = data.gpuTypes.filter((gpu) => gpu.id !== 'unknown');
 
-      if (!params.includeUnavailable) {
+      // Full catalog by default; opt in (includeUnavailable:false) to hide out-of-stock.
+      if (params.includeUnavailable === false) {
         gpuTypes = gpuTypes.filter(isAvailable);
       }
       if (params.minMemoryGb) {
@@ -256,9 +294,15 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   // Get GPU Type by id (v2-only — GET /v2/catalog/gpus/{id})
   server.tool(
     'get-gpu-type',
-    'Get details for a single GPU type by id. v2-only — returns a 501 notice on the v1 API (use list-gpu-types there).',
+    'Get details for a single GPU type by id, including per-datacenter availability. v2-only — returns a 501 notice on the v1 API (use list-gpu-types there). Use the returned dataCenters[].availability to pick a dataCenterIds with stock before creating a pod.',
     {
       gpuTypeId: z.string().describe('ID of the GPU type to retrieve'),
+      includeAvailability: z
+        .boolean()
+        .optional()
+        .describe(
+          'Include realtime per-datacenter availability (HIGH/MEDIUM/LOW/NONE). Default true.'
+        ),
     },
     { title: 'Get GPU type', ...READ_ONLY },
     async (params) => {
@@ -270,9 +314,12 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
           status: 501,
         });
       }
-      const result = await callRestUrl(
-        `${backend.base}${backend.get!(params.gpuTypeId)}`
-      );
+      // GPU ids contain spaces (e.g. "NVIDIA GeForce RTX 4090"), so encode the
+      // path segment. Availability on by default — it's the point of a single GPU.
+      const path = backend.get!(encodeURIComponent(params.gpuTypeId));
+      const query =
+        params.includeAvailability === false ? '' : '?include=AVAILABILITY';
+      const result = await callRestUrl(`${backend.base}${path}${query}`);
       return jsonReply(result);
     }
   );
