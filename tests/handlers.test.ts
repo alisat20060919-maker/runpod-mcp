@@ -2115,6 +2115,28 @@ describe('list-hub-repos (public GraphQL Hub catalog)', () => {
     assert.equal(pagination.truncated, true);
     assert.ok(pagination.nextCursor);
   });
+
+  it('orders deploy-count ties deterministically, so paging cannot skip or duplicate', async () => {
+    // Each page re-fetches the whole catalog and `listings(input: {})` promises
+    // no order, so sorting on `deploys` alone lets ties move between requests
+    // and page 2 re-shows or skips entries. Same listings in a different input
+    // order must yield the same page.
+    const tied = [
+      { ...listings[0], id: 'l_c', repoName: 'c', deploys: 0 },
+      { ...listings[0], id: 'l_a', repoName: 'a', deploys: 0 },
+      { ...listings[0], id: 'l_b', repoName: 'b', deploys: 0 },
+    ];
+    const order = async (input: typeof tied) => {
+      const { handlers } = harness({ jsonBody: { data: { listings: input } } });
+      const out = await handlers.get('list-hub-repos')!({});
+      return (parseText(out).items as Array<{ id: string }>).map((i) => i.id);
+    };
+
+    const first = await order(tied);
+    const reversed = await order([...tied].reverse());
+    assert.deepEqual(first, ['l_a', 'l_b', 'l_c']);
+    assert.deepEqual(reversed, first);
+  });
 });
 
 // Public Endpoints (managed model APIs) share the public GraphQL path with the
@@ -2520,6 +2542,13 @@ describe('deploy-hub-repo (authenticated GraphQL saveEndpoint)', () => {
 // changed (call 2). The echo matters: saveEndpoint resets omitted endpoint
 // scalars to server defaults (verified live), so these tests pin that every
 // current value is carried over verbatim.
+//
+// Assertions are derived FROM the fixture, not from a copy of the
+// implementation's object literal. A hand-copied expectation is a
+// change-detector that passes when a field is missing from both sides at once —
+// exactly how templateId/minCudaVersion/allowedCudaVersions/compliance/
+// modelReferences went unnoticed. `preservedKeys` is the real contract: add a
+// field to the fixture and the test demands it be echoed.
 describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
   const endpoints = [
     {
@@ -2536,6 +2565,11 @@ describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
       flashBootType: 'PRIORITY_FLASHBOOT',
       type: 'QB',
       locations: 'US-TX-3',
+      templateId: 'tpl_pinme',
+      allowedCudaVersions: '12.4,12.8',
+      minCudaVersion: '12.4',
+      compliance: ['GDPR'],
+      modelReferences: ['model_a'],
       networkVolumeIds: [{ networkVolumeId: 'nv_1', dataCenterId: 'US-TX-3' }],
     },
     {
@@ -2552,9 +2586,21 @@ describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
       flashBootType: 'FLASHBOOT',
       type: 'QB',
       locations: null,
+      templateId: 'tpl_plain',
+      // No CUDA constraint or tags on this endpoint: these read null.
+      allowedCudaVersions: null,
+      minCudaVersion: null,
+      compliance: null,
+      modelReferences: null,
       networkVolumeIds: [],
     },
   ];
+  // Fixture keys that must survive the echo unchanged. gpuIds is the one field
+  // the tool replaces; networkVolumeIds is asserted separately because read and
+  // write use different shapes.
+  const preservedKeys = Object.keys(endpoints[0]).filter(
+    (k) => k !== 'gpuIds' && k !== 'networkVolumeIds'
+  );
   const queryBody = { data: { myself: { endpoints } } };
   const saveBody = {
     data: {
@@ -2588,22 +2634,33 @@ describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
         variables: { input: Record<string, unknown> };
       }
     ).variables.input;
-    assert.deepEqual(input, {
-      id: 'ep_pinme',
-      name: 'my-endpoint',
-      gpuIds: 'AMPERE_16,-NVIDIA RTX A4500',
-      gpuCount: 1,
-      workersMin: 2,
-      workersMax: 7,
-      idleTimeout: 42,
-      scalerType: 'REQUEST_COUNT',
-      scalerValue: 9,
-      executionTimeoutMs: 123000,
-      flashBootType: 'PRIORITY_FLASHBOOT',
-      type: 'QB',
-      locations: 'US-TX-3',
-      networkVolumeIds: [{ networkVolumeId: 'nv_1', dataCenterId: 'US-TX-3' }],
-    });
+    // Every preserved key must be echoed with the value the read returned.
+    for (const key of preservedKeys) {
+      assert.deepEqual(
+        input[key],
+        (endpoints[0] as Record<string, unknown>)[key],
+        `${key} must be echoed back unchanged (saveEndpoint resets omitted fields)`
+      );
+    }
+    assert.equal(input.gpuIds, 'AMPERE_16,-NVIDIA RTX A4500');
+    // NetworkVolumeIdsInput accepts networkVolumeId ONLY; the server rejects
+    // dataCenterId outright, breaking every endpoint with a volume. So assert
+    // the exact key set, not just the id.
+    assert.deepEqual(input.networkVolumeIds, [{ networkVolumeId: 'nv_1' }]);
+    for (const entry of input.networkVolumeIds as Array<
+      Record<string, unknown>
+    >) {
+      assert.deepEqual(
+        Object.keys(entry),
+        ['networkVolumeId'],
+        'NetworkVolumeIdsInput accepts networkVolumeId only'
+      );
+    }
+    // No stray fields beyond the echo + the GPU change.
+    assert.deepEqual(
+      Object.keys(input).sort(),
+      [...preservedKeys, 'gpuIds', 'networkVolumeIds'].sort()
+    );
     const payload = parseText(out);
     assert.equal(payload.previousGpuIds, 'AMPERE_16');
     assert.equal((payload.endpoint as { id: string }).id, 'ep_pinme');
@@ -2631,6 +2688,47 @@ describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
     assert.equal(input.gpuCount, 2);
     assert.equal(input.networkVolumeIds, null);
     assert.equal(input.workersMax, 1);
+    // ep_plain has a template but no CUDA constraint, tags or model references:
+    // the template is carried over, the null fields omitted rather than sent as
+    // explicit nulls.
+    assert.equal(input.templateId, 'tpl_plain');
+    for (const key of [
+      'allowedCudaVersions',
+      'minCudaVersion',
+      'compliance',
+      'modelReferences',
+    ]) {
+      assert.equal(key in input, false, `${key} is null — omit, do not send`);
+    }
+  });
+
+  it('sends the authenticated GraphQL host, not the public-discovery one', async () => {
+    // The API key must not follow RUNPOD_PUBLIC_GRAPHQL_URL — the documented
+    // credential-free discovery override, freely pointed at stubs.
+    const prevPublic = process.env.RUNPOD_PUBLIC_GRAPHQL_URL;
+    const prevAuthed = process.env.RUNPOD_AUTHED_GRAPHQL_URL;
+    process.env.RUNPOD_PUBLIC_GRAPHQL_URL = 'https://public.stub/graphql';
+    process.env.RUNPOD_AUTHED_GRAPHQL_URL = 'https://authed.example/graphql';
+    try {
+      const { handlers, outbound } = harness({
+        jsonBodies: [queryBody, saveBody],
+      });
+      await handlers.get('set-endpoint-gpus')!({
+        endpointId: 'ep_pinme',
+        gpuIds: 'ADA_24',
+      });
+      for (const call of outbound) {
+        assert.equal(call.url, 'https://authed.example/graphql');
+        assert.equal(call.headers?.Authorization, 'Bearer rpa_test');
+      }
+    } finally {
+      if (prevPublic === undefined)
+        delete process.env.RUNPOD_PUBLIC_GRAPHQL_URL;
+      else process.env.RUNPOD_PUBLIC_GRAPHQL_URL = prevPublic;
+      if (prevAuthed === undefined)
+        delete process.env.RUNPOD_AUTHED_GRAPHQL_URL;
+      else process.env.RUNPOD_AUTHED_GRAPHQL_URL = prevAuthed;
+    }
   });
 
   it('fails BEFORE any mutation: unknown endpoint (after read), and missing GPU params (no calls at all)', async () => {

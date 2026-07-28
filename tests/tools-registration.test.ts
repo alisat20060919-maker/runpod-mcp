@@ -167,8 +167,15 @@ describe('tool registration', () => {
   });
 
   it('exposes limit + cursor pagination params on every list-* tool', () => {
-    const { schemas } = captureRegisteredTools();
-    for (const tool of LIST_TOOLS) {
+    const { names, schemas } = captureRegisteredTools();
+    // Derived, not hardcoded: LIST_TOOLS is a fixed subset, so a new list-*
+    // tool would join the surface ungated by this check.
+    const listTools = names.filter((n) => n.startsWith('list-'));
+    assert.ok(
+      listTools.length >= LIST_TOOLS.length,
+      'expected to discover at least the known list tools'
+    );
+    for (const tool of listTools) {
       const schema = schemas.get(tool);
       assert.ok(schema, `no schema captured for ${tool}`);
       assert.ok('limit' in schema, `${tool} missing 'limit' param`);

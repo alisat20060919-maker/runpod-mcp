@@ -144,10 +144,11 @@ const ALLOWLIST_UNMAPPED_OPS: Record<string, string> = {
     'list-endpoint-releases implemented but disabled — dev-only op, prod 422s GET /v2/serverless/{id}/releases',
 };
 
-// Registered tools that intentionally have NO v2 REST spec operation. The
-// serverless RUNTIME tools target a different service (api.runpod.ai/v2 — job
-// submission/streaming), which is not part of this control-plane REST spec.
-const ALLOWLIST_UNMAPPED_TOOLS: Record<string, string> = {
+// Tools that will NEVER have a v2 REST spec operation: the serverless RUNTIME
+// tools target a different service (api.runpod.ai/v2 — job submission and
+// streaming), which is not part of this control-plane REST spec. These entries
+// are permanent.
+const ALLOWLIST_NEVER_REST: Record<string, string> = {
   'run-endpoint': 'serverless runtime API (api.runpod.ai/v2), not v2 REST',
   'runsync-endpoint': 'serverless runtime API, not v2 REST',
   'get-job-status': 'serverless runtime API, not v2 REST',
@@ -156,14 +157,28 @@ const ALLOWLIST_UNMAPPED_TOOLS: Record<string, string> = {
   'retry-job': 'serverless runtime API, not v2 REST',
   'endpoint-health': 'serverless runtime API, not v2 REST',
   'purge-endpoint-queue': 'serverless runtime API, not v2 REST',
+};
+
+// Tools exempt only until the REST API catches up — a to-do list, not a
+// permanent carve-out. Kept separate from ALLOWLIST_NEVER_REST because the two
+// read identically once merged, and a "not yet" that nothing ever revisits
+// becomes a permanent hole in this gate: the tool stays unguarded long after
+// REST ships. Delete an entry (and add the mapping) when its op appears in the
+// spec.
+const ALLOWLIST_PENDING_REST: Record<string, string> = {
   'list-hub-repos':
-    'Hub catalog is served by the public GraphQL endpoint; no v2 REST home yet',
+    'Hub catalog is served by the public GraphQL endpoint; no v2 REST home yet (revisit when the Hub gets REST)',
   'deploy-hub-repo':
-    'Hub deploys go through the authenticated GraphQL saveEndpoint mutation; no v2 REST home yet',
+    'Hub deploys go through the authenticated GraphQL saveEndpoint mutation; no v2 REST home yet (revisit when the Hub gets REST)',
   'set-endpoint-gpus':
-    'GPU SKU pinning is only expressible via the GraphQL saveEndpoint gpuIds string; no REST equivalent',
+    'GPU SKU pinning is only expressible via the GraphQL saveEndpoint gpuIds string; no REST equivalent (revisit if gpuPoolIds gains SKU exclusion)',
   'list-public-endpoints':
-    'Public Endpoints catalog is served by the public GraphQL endpoint; no v2 REST home yet',
+    'Public Endpoints catalog is served by the public GraphQL endpoint; no v2 REST home yet (revisit when Public Endpoints get REST)',
+};
+
+const ALLOWLIST_UNMAPPED_TOOLS: Record<string, string> = {
+  ...ALLOWLIST_NEVER_REST,
+  ...ALLOWLIST_PENDING_REST,
 };
 
 const specYaml = readFileSync(
