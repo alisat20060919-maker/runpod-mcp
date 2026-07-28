@@ -158,6 +158,8 @@ const ALLOWLIST_UNMAPPED_TOOLS: Record<string, string> = {
   'purge-endpoint-queue': 'serverless runtime API, not v2 REST',
   'list-hub-repos':
     'Hub catalog is served by the public GraphQL endpoint; no v2 REST home yet',
+  'deploy-hub-repo':
+    'Hub deploys go through the authenticated GraphQL saveEndpoint mutation; no v2 REST home yet',
   'list-public-endpoints':
     'Public Endpoints catalog is served by the public GraphQL endpoint; no v2 REST home yet',
 };

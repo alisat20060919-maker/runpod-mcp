@@ -162,6 +162,14 @@ export interface ToolRuntime {
   jsonReply: typeof jsonReply;
   // Public, no-auth GraphQL query against the Runpod GraphQL endpoint.
   graphql: <T>(query: string) => Promise<T>;
+  // Authenticated GraphQL operation (API-key Bearer) against the same endpoint,
+  // with variables support — the authenticated path accepts them (the public,
+  // unauthenticated path does not). Used for console-only operations that have
+  // no REST home yet (e.g. deploying a Hub release via saveEndpoint).
+  graphqlAuthed: <T>(
+    query: string,
+    variables?: Record<string, unknown>
+  ) => Promise<T>;
   // Authenticated v1 REST call, path-relative to the v1 base (e.g. `/endpoints`).
   runpodRequest: (
     endpoint: string,
@@ -206,15 +214,23 @@ async function graphqlRequest<T>(
   query: string,
   tracking: () => Record<string, string>,
   fetchImpl: HttpFetch,
-  url: string
+  url: string,
+  options?: {
+    variables?: Record<string, unknown>;
+    apiKey?: string;
+  }
 ): Promise<T> {
   const response = await fetchImpl(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...(options?.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
       ...tracking(),
     },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({
+      query,
+      ...(options?.variables ? { variables: options.variables } : {}),
+    }),
   });
 
   const result = (await response.json()) as {
@@ -354,6 +370,14 @@ export function createToolRuntime(
         tracking,
         httpFetch,
         publicGraphqlBase(process.env as Env)
+      ),
+    graphqlAuthed: <T>(query: string, variables?: Record<string, unknown>) =>
+      graphqlRequest<T>(
+        query,
+        tracking,
+        httpFetch,
+        publicGraphqlBase(process.env as Env),
+        { variables, apiKey: ctx.apiKey }
       ),
     runpodRequest,
     serverlessRequest,

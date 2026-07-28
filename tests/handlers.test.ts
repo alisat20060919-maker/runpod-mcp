@@ -33,6 +33,7 @@ interface OutboundRecord {
   url: string;
   method: string;
   body?: string;
+  headers?: Record<string, string>;
 }
 
 function harness(opts?: {
@@ -71,7 +72,12 @@ function harness(opts?: {
     url: string,
     init: { method: string; headers: Record<string, string>; body?: string }
   ) => {
-    outbound.push({ url, method: init.method, body: init.body });
+    outbound.push({
+      url,
+      method: init.method,
+      body: init.body,
+      headers: init.headers,
+    });
     const jsonBody = queue
       ? (queue.shift() ?? opts?.jsonBody ?? [])
       : (opts?.jsonBody ?? []);
@@ -2233,5 +2239,278 @@ describe('list-public-endpoints (public GraphQL catalog)', () => {
     assert.equal(pagination.total, 2);
     assert.equal(pagination.truncated, true);
     assert.ok(pagination.nextCursor);
+  });
+});
+
+// deploy-hub-repo: resolves the release from the public catalog (call 1), then
+// submits the authenticated saveEndpoint mutation with variables (call 2).
+// These pin the mutation input the console builds — hubReleaseId, config-derived
+// hardware, env defaults + overrides — and the guard rails that fail BEFORE any
+// mutation is sent.
+describe('deploy-hub-repo (authenticated GraphQL saveEndpoint)', () => {
+  const catalogListings = [
+    {
+      id: 'lst_vllm',
+      repoId: '1',
+      title: 'vLLM',
+      description: 'LLM endpoints',
+      repoName: 'worker-vllm',
+      repoOwner: 'runpod-workers',
+      createdAt: '2025-03-20T07:03:50.990Z',
+      updatedAt: '2026-07-28T15:34:28.240Z',
+      views: 1,
+      stars: 1,
+      deploys: 100,
+      language: 'Python',
+      category: 'language',
+      tags: ['llm'],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_vllm',
+        name: 'v2.22.5',
+        tagName: 'v2.22.5',
+        createdAt: '2026-06-26T18:48:13.000Z',
+        config: JSON.stringify({
+          runsOn: 'GPU',
+          containerDiskInGb: 150,
+          gpuIds: 'ADA_80_PRO,AMPERE_80',
+          gpuCount: 1,
+          allowedCudaVersions: ['12.8', '12.4', '12.6'],
+          env: [
+            {
+              key: 'MODEL_NAME',
+              input: { type: 'huggingface', required: true },
+            },
+            { key: 'MAX_NUM_SEQS', input: { type: 'number', default: 256 } },
+            {
+              key: 'TRUST_REMOTE_CODE',
+              input: {
+                type: 'boolean',
+                default: false,
+                trueValue: '1',
+                falseValue: '0',
+              },
+            },
+            { key: 'TOKENIZER', input: { type: 'string', default: '' } },
+          ],
+        }),
+        build: { id: 'b1', imageName: 'registry.runpod.net/worker-vllm:9e1' },
+      },
+    },
+    {
+      id: 'lst_pod',
+      repoId: '2',
+      title: 'Some Pod Thing',
+      description: 'pod listing',
+      repoName: 'pod-thing',
+      repoOwner: 'someone',
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+      views: 0,
+      stars: 0,
+      deploys: 0,
+      language: 'Python',
+      category: 'image',
+      tags: [],
+      type: 'POD',
+      listedRelease: {
+        id: 'rel_pod',
+        name: '1.0',
+        tagName: '1.0',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        config: '{}',
+        build: { id: 'b2', imageName: 'registry.runpod.net/pod-thing:abc' },
+      },
+    },
+    {
+      id: 'lst_nogpu',
+      repoId: '3',
+      title: 'No GPU Config',
+      description: 'config without gpuIds',
+      repoName: 'no-gpu',
+      repoOwner: 'someone',
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+      views: 0,
+      stars: 0,
+      deploys: 0,
+      language: 'Python',
+      category: 'language',
+      tags: [],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_nogpu',
+        name: '1.0',
+        tagName: '1.0',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        config: '{"containerDiskInGb":200,"env":[]}',
+        build: { id: 'b3', imageName: 'registry.runpod.net/no-gpu:abc' },
+      },
+    },
+  ];
+  const catalogBody = { data: { listings: catalogListings } };
+  const saveBody = {
+    data: {
+      saveEndpoint: {
+        id: 'ep_new',
+        name: 'vLLM v2.22.5',
+        gpuIds: 'ADA_80_PRO,AMPERE_80',
+        gpuCount: 1,
+        workersMin: 0,
+        workersMax: 3,
+        idleTimeout: 5,
+        scalerType: 'QUEUE_DELAY',
+        scalerValue: 4,
+        flashBootType: 'FLASHBOOT',
+        templateId: 'tpl_new',
+      },
+    },
+  };
+
+  it('happy path (by repo): catalog query then authenticated saveEndpoint with the console-shaped input', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [catalogBody, saveBody],
+    });
+    const out = await handlers.get('deploy-hub-repo')!({
+      repo: 'runpod-workers/worker-vllm',
+      env: { MODEL_NAME: 'openai/gpt-oss-20b', EXTRA_FLAG: 'yes' },
+    });
+
+    assert.equal(outbound.length, 2);
+    // Call 1: public catalog resolution (query with config, no bearer auth).
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.match(
+      JSON.parse(outbound[0].body!).query,
+      /listings\(input: \{\}\)/
+    );
+    assert.equal('Authorization' in (outbound[0].headers ?? {}), false);
+    // Call 2: authenticated mutation with variables.
+    assert.equal(outbound[1].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[1].headers?.Authorization, 'Bearer rpa_test');
+    const body = JSON.parse(outbound[1].body!) as {
+      query: string;
+      variables: { input: Record<string, unknown> };
+    };
+    assert.match(
+      body.query,
+      /mutation saveEndpoint\(\$input: EndpointInput!\)/
+    );
+    const input = body.variables.input;
+    assert.equal(input.hubReleaseId, 'rel_vllm');
+    assert.equal(input.name, 'vLLM v2.22.5');
+    assert.equal(input.type, 'QB');
+    assert.equal(input.gpuIds, 'ADA_80_PRO,AMPERE_80');
+    assert.equal(input.gpuCount, 1);
+    assert.equal(input.workersMin, 0);
+    assert.equal(input.workersMax, null);
+    assert.equal(input.idleTimeout, 5);
+    assert.equal(input.scalerType, 'QUEUE_DELAY');
+    assert.equal(input.scalerValue, 4);
+    assert.equal(input.executionTimeoutMs, 600000);
+    assert.equal(input.flashBootType, 'FLASHBOOT');
+    // min of ['12.8','12.4','12.6'] numeric-aware, list joined verbatim.
+    assert.equal(input.minCudaVersion, '12.4');
+    assert.equal(input.allowedCudaVersions, '12.8,12.4,12.6');
+    const template = input.template as Record<string, unknown>;
+    assert.equal(template.imageName, 'registry.runpod.net/worker-vllm:9e1');
+    assert.equal(template.containerDiskInGb, 150);
+    assert.match(
+      String(template.name),
+      /^vLLM v2\.22\.5__template__[a-z0-9]+$/
+    );
+    // Env: schema defaults + overrides + passthrough of unknown keys; booleans
+    // serialized through trueValue/falseValue.
+    assert.deepEqual(template.env, [
+      { key: 'MODEL_NAME', value: 'openai/gpt-oss-20b' },
+      { key: 'MAX_NUM_SEQS', value: '256' },
+      { key: 'TRUST_REMOTE_CODE', value: '0' },
+      { key: 'TOKENIZER', value: '' },
+      { key: 'EXTRA_FLAG', value: 'yes' },
+    ]);
+    // Reply carries the new endpoint and what was deployed.
+    const payload = parseText(out);
+    assert.equal((payload.endpoint as { id: string }).id, 'ep_new');
+    assert.equal(
+      (payload.deployed as { hubReleaseId: string }).hubReleaseId,
+      'rel_vllm'
+    );
+  });
+
+  it('resolves by hubReleaseId and honors overrides (name, gpu, workers, disk, flashboot)', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [catalogBody, saveBody],
+    });
+    await handlers.get('deploy-hub-repo')!({
+      hubReleaseId: 'rel_vllm',
+      name: 'my-vllm',
+      env: { MODEL_NAME: 'm' },
+      gpuIds: 'AMPERE_80',
+      gpuCount: 2,
+      containerDiskInGb: 300,
+      workersMin: 1,
+      workersMax: 5,
+      idleTimeout: 30,
+      scalerType: 'REQUEST_COUNT',
+      scalerValue: 2,
+      executionTimeoutMs: 900000,
+      flashboot: 'OFF',
+    });
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.equal(input.hubReleaseId, 'rel_vllm');
+    assert.equal(input.name, 'my-vllm');
+    assert.equal(input.gpuIds, 'AMPERE_80');
+    assert.equal(input.gpuCount, 2);
+    assert.equal(input.workersMin, 1);
+    assert.equal(input.workersMax, 5);
+    assert.equal(input.idleTimeout, 30);
+    assert.equal(input.scalerType, 'REQUEST_COUNT');
+    assert.equal(input.scalerValue, 2);
+    assert.equal(input.executionTimeoutMs, 900000);
+    assert.equal(input.flashBootType, 'OFF');
+    assert.equal(
+      (input.template as Record<string, unknown>).containerDiskInGb,
+      300
+    );
+  });
+
+  it('fails BEFORE the mutation: missing required env vars', async () => {
+    const { handlers, outbound } = harness({ jsonBodies: [catalogBody] });
+    const out = await handlers.get('deploy-hub-repo')!({
+      repo: 'runpod-workers/worker-vllm',
+    });
+    assert.equal(outbound.length, 1); // catalog only, no mutation
+    assert.match(parseText(out).error as string, /MODEL_NAME/);
+  });
+
+  it('fails BEFORE the mutation: no gpuIds in config and none provided', async () => {
+    const { handlers, outbound } = harness({ jsonBodies: [catalogBody] });
+    const out = await handlers.get('deploy-hub-repo')!({
+      repo: 'someone/no-gpu',
+    });
+    assert.equal(outbound.length, 1);
+    assert.match(parseText(out).error as string, /gpuIds/);
+  });
+
+  it('fails BEFORE the mutation: POD listings, unknown repos, and missing identifiers', async () => {
+    const pod = harness({ jsonBodies: [catalogBody] });
+    const podOut = await pod.handlers.get('deploy-hub-repo')!({
+      repo: 'someone/pod-thing',
+    });
+    assert.match(parseText(podOut).error as string, /only SERVERLESS/);
+
+    const unknown = harness({ jsonBodies: [catalogBody] });
+    const unknownOut = await unknown.handlers.get('deploy-hub-repo')!({
+      repo: 'nobody/nothing',
+    });
+    assert.match(parseText(unknownOut).error as string, /No Hub listing/);
+
+    const none = harness({ jsonBodies: [catalogBody] });
+    const noneOut = await none.handlers.get('deploy-hub-repo')!({});
+    assert.equal(none.outbound.length, 0); // no calls at all
+    assert.match(parseText(noneOut).error as string, /repo .*or hubReleaseId/);
   });
 });

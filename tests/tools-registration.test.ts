@@ -71,6 +71,7 @@ const EXPECTED_TOOLS = [
   'get-data-center',
   // hub
   'list-hub-repos',
+  'deploy-hub-repo',
   // public endpoints
   'list-public-endpoints',
   // pods

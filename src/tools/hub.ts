@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { capListResult, listPaginationParams } from '../pagination.js';
-import { READ_ONLY, type ToolRuntime } from './runtime.js';
+import { READ_ONLY, WRITE, type ToolRuntime } from './runtime.js';
 
 // ============== HUB TOOLS ==============
 // Read-only discovery of Runpod Hub listings (prebuilt serverless workers and
@@ -66,8 +66,128 @@ function parseReleaseConfig(config: string | null | undefined): unknown {
   }
 }
 
+// Typed view of the parts of the release config a deploy consumes. Everything
+// is optional — the config is repo-authored and defensively read.
+interface HubReleaseConfig {
+  runsOn?: string;
+  containerDiskInGb?: number;
+  gpuIds?: string;
+  gpuCount?: number;
+  allowedCudaVersions?: string[];
+  env?: Array<{
+    key: string;
+    input?: {
+      name?: string;
+      type?: string;
+      default?: unknown;
+      required?: boolean;
+      trueValue?: string;
+      falseValue?: string;
+    };
+  }>;
+}
+
+// The one listings query both hub tools share. `withConfig` pulls in the
+// (large) release config only when the caller needs it.
+function listingsQuery(withConfig: boolean): string {
+  return `
+    query {
+      listings(input: {}) {
+        id
+        repoId
+        title
+        description
+        repoName
+        repoOwner
+        createdAt
+        updatedAt
+        views
+        stars
+        deploys
+        language
+        category
+        tags
+        type
+        listedRelease {
+          id
+          name
+          tagName
+          createdAt${withConfig ? '\n          config' : ''}
+          build {
+            id
+            imageName
+          }
+        }
+      }
+    }
+  `;
+}
+
+// Builds the template env array a Hub deploy submits: every key from the
+// release's env schema with its default (booleans serialized through
+// trueValue/falseValue), overridden by caller-provided values. Caller keys not
+// in the schema are appended verbatim. Returns the missing required keys so
+// the tool can fail with an actionable message instead of a broken endpoint.
+export function buildHubEnv(
+  config: HubReleaseConfig,
+  overrides: Record<string, string>
+): {
+  env: Array<{ key: string; value: string }>;
+  missingRequired: string[];
+} {
+  const env: Array<{ key: string; value: string }> = [];
+  const missingRequired: string[] = [];
+  const remaining = { ...overrides };
+
+  for (const entry of config.env ?? []) {
+    const input = entry.input ?? {};
+    let value: string;
+    if (entry.key in remaining) {
+      value = remaining[entry.key];
+      delete remaining[entry.key];
+    } else if (input.default !== undefined && input.default !== null) {
+      value =
+        typeof input.default === 'boolean'
+          ? input.default
+            ? (input.trueValue ?? 'true')
+            : (input.falseValue ?? 'false')
+          : String(input.default);
+    } else {
+      if (input.required) missingRequired.push(entry.key);
+      value = '';
+    }
+    env.push({ key: entry.key, value });
+  }
+
+  for (const [key, value] of Object.entries(remaining)) {
+    env.push({ key, value });
+  }
+
+  return { env, missingRequired };
+}
+
+// Lowest entry of the config's allowedCudaVersions (numeric-aware compare, so
+// '12.10' > '12.9'). The console submits this as minCudaVersion.
+export function minCudaVersion(versions: string[] | undefined): string | null {
+  if (!versions || versions.length === 0) return null;
+  const compare = (a: string, b: string) => {
+    const pa = a.split('.').map(Number);
+    const pb = b.split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  };
+  return [...versions].sort(compare)[0];
+}
+
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
 export function registerHubTools(server: McpServer, rt: ToolRuntime): void {
-  const { graphql } = rt;
+  const { graphql, graphqlAuthed, jsonReply } = rt;
 
   server.tool(
     'list-hub-repos',
@@ -107,38 +227,9 @@ export function registerHubTools(server: McpServer, rt: ToolRuntime): void {
     },
     { title: 'List Hub repos', ...READ_ONLY },
     async (params) => {
-      const configField = params.includeConfig ? '\n            config' : '';
-      const data = await graphql<ListingsResponse>(`
-        query {
-          listings(input: {}) {
-            id
-            repoId
-            title
-            description
-            repoName
-            repoOwner
-            createdAt
-            updatedAt
-            views
-            stars
-            deploys
-            language
-            category
-            tags
-            type
-            listedRelease {
-              id
-              name
-              tagName
-              createdAt${configField}
-              build {
-                id
-                imageName
-              }
-            }
-          }
-        }
-      `);
+      const data = await graphql<ListingsResponse>(
+        listingsQuery(params.includeConfig === true)
+      );
 
       let listings = data.listings;
 
@@ -210,6 +301,243 @@ export function registerHubTools(server: McpServer, rt: ToolRuntime): void {
       return capListResult(result, {
         limit: params.limit,
         cursor: params.cursor,
+      });
+    }
+  );
+
+  server.tool(
+    'deploy-hub-repo',
+    "Deploy a Runpod Hub repo's listed release as a new Serverless endpoint (the same as clicking Deploy on the Hub). Identify the repo by `repo` (\"owner/name\" from list-hub-repos) or by `hubReleaseId`. The release supplies the prebuilt image, container disk, CUDA constraints, and env-var defaults; pass `env` to override or fill in values (required keys without a default must be provided — check list-hub-repos with includeConfig:true for the schema). GPU selection comes from the release config when it specifies one; otherwise pass gpuIds (GPU pool names, e.g. 'ADA_24' or 'ADA_80_PRO,AMPERE_80'). Uses the authenticated GraphQL API (no REST home for Hub deploys yet), so it works the same on v1 and v2.",
+    {
+      repo: z
+        .string()
+        .optional()
+        .describe(
+          'The Hub repo to deploy as "owner/name" (e.g. \'runpod-workers/worker-comfyui\'). Deploys its currently listed release. Provide this or hubReleaseId.'
+        ),
+      hubReleaseId: z
+        .string()
+        .optional()
+        .describe(
+          'The Hub release ID to deploy (from list-hub-repos listedRelease.hubReleaseId). Provide this or repo.'
+        ),
+      name: z
+        .string()
+        .optional()
+        .describe(
+          "Name for the new endpoint. Defaults to '<listing title> <release tag>'."
+        ),
+      env: z
+        .record(z.string())
+        .optional()
+        .describe(
+          'Environment variable overrides, merged over the release config defaults. Keys not in the release schema are passed through as-is.'
+        ),
+      gpuIds: z
+        .string()
+        .optional()
+        .describe(
+          "Comma-separated GPU pool names for workers (e.g. 'ADA_24' or 'ADA_80_PRO,AMPERE_80'). Defaults to the release config's gpuIds; required when the config does not specify one."
+        ),
+      gpuCount: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('GPUs per worker. Defaults to the release config (or 1).'),
+      containerDiskInGb: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Container disk size in GB. Defaults to the release config.'),
+      workersMin: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Minimum workers (default 0 — scale to zero).'),
+      workersMax: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Maximum workers (default: account default).'),
+      idleTimeout: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Seconds a worker idles before scaling down (default 5).'),
+      scalerType: z
+        .enum(['QUEUE_DELAY', 'REQUEST_COUNT'])
+        .optional()
+        .describe('Autoscaler type (default QUEUE_DELAY).'),
+      scalerValue: z
+        .number()
+        .optional()
+        .describe('Autoscaler target value (default 4).'),
+      executionTimeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('Per-job execution timeout in ms (default 600000).'),
+      flashboot: z
+        .enum(['OFF', 'FLASHBOOT', 'PRIORITY_FLASHBOOT'])
+        .optional()
+        .describe('FlashBoot mode (default FLASHBOOT).'),
+    },
+    { title: 'Deploy Hub repo', ...WRITE },
+    async (params) => {
+      if (!params.repo && !params.hubReleaseId) {
+        return jsonReply({
+          error:
+            'Provide either repo ("owner/name") or hubReleaseId. Use list-hub-repos to discover both.',
+        });
+      }
+
+      // Resolve the listing + release from the public catalog. The catalog only
+      // exposes each repo's currently LISTED release, so a hubReleaseId must
+      // match one of those (which is also the only state the console deploys).
+      const catalog = await graphql<ListingsResponse>(listingsQuery(true));
+      let listing: HubListing | undefined;
+      if (params.hubReleaseId) {
+        listing = catalog.listings.find(
+          (l) => l.listedRelease?.id === params.hubReleaseId
+        );
+      } else {
+        const repoKey = params.repo!.toLowerCase();
+        listing = catalog.listings.find(
+          (l) => `${l.repoOwner}/${l.repoName}`.toLowerCase() === repoKey
+        );
+      }
+      if (!listing) {
+        return jsonReply({
+          error: `No Hub listing found for ${
+            params.hubReleaseId
+              ? `hubReleaseId "${params.hubReleaseId}" (only each repo's currently listed release is deployable)`
+              : `repo "${params.repo}"`
+          }. Use list-hub-repos to see the catalog.`,
+        });
+      }
+      const release = listing.listedRelease;
+      if (!release?.build?.imageName) {
+        return jsonReply({
+          error: `Hub repo ${listing.repoOwner}/${listing.repoName} has no listed release with a built image, so it cannot be deployed.`,
+        });
+      }
+      if ((listing.type ?? '').toUpperCase() !== 'SERVERLESS') {
+        return jsonReply({
+          error: `Hub repo ${listing.repoOwner}/${listing.repoName} is a ${listing.type} listing — only SERVERLESS listings deploy as endpoints.`,
+        });
+      }
+
+      const config = (parseReleaseConfig(release.config) ??
+        {}) as HubReleaseConfig;
+
+      const gpuIds = params.gpuIds ?? config.gpuIds;
+      if (!gpuIds) {
+        return jsonReply({
+          error:
+            'This release does not specify a GPU pool — pass gpuIds (comma-separated pool names, e.g. "ADA_80_PRO,AMPERE_80"; see the pool field on list-gpu-types).',
+        });
+      }
+
+      const { env, missingRequired } = buildHubEnv(config, params.env ?? {});
+      if (missingRequired.length > 0) {
+        return jsonReply({
+          error: `Missing required environment variables for this release: ${missingRequired.join(
+            ', '
+          )}. Pass them via the env parameter.`,
+        });
+      }
+
+      const endpointName = params.name ?? `${listing.title} ${release.tagName}`;
+      const minCuda = minCudaVersion(config.allowedCudaVersions);
+
+      const input: Record<string, unknown> = {
+        name: endpointName,
+        hubReleaseId: release.id,
+        type: 'QB',
+        gpuIds,
+        gpuCount: params.gpuCount ?? config.gpuCount ?? 1,
+        workersMin: params.workersMin ?? 0,
+        workersMax: params.workersMax ?? null,
+        idleTimeout: params.idleTimeout ?? 5,
+        scalerType: params.scalerType ?? 'QUEUE_DELAY',
+        scalerValue: params.scalerValue ?? 4,
+        executionTimeoutMs: params.executionTimeoutMs ?? 600000,
+        flashBootType: params.flashboot ?? 'FLASHBOOT',
+        locations: null,
+        networkVolumeIds: null,
+        compliance: [],
+        modelReferences: [],
+        ...(minCuda
+          ? {
+              minCudaVersion: minCuda,
+              allowedCudaVersions: config.allowedCudaVersions!.join(','),
+            }
+          : {}),
+        template: {
+          name: `${endpointName}__template__${randomSuffix()}`,
+          imageName: release.build.imageName,
+          containerDiskInGb:
+            params.containerDiskInGb ?? config.containerDiskInGb ?? 20,
+          containerRegistryAuthId: '',
+          dockerArgs: '',
+          startScript: '',
+          ports: '',
+          env,
+        },
+      };
+
+      interface SaveEndpointResponse {
+        saveEndpoint: {
+          id: string;
+          name: string;
+          gpuIds: string;
+          gpuCount: number;
+          workersMin: number;
+          workersMax: number | null;
+          idleTimeout: number;
+          scalerType: string;
+          scalerValue: number;
+          flashBootType: string;
+          templateId: string;
+        };
+      }
+
+      const data = await graphqlAuthed<SaveEndpointResponse>(
+        `
+          mutation saveEndpoint($input: EndpointInput!) {
+            saveEndpoint(input: $input) {
+              id
+              name
+              gpuIds
+              gpuCount
+              workersMin
+              workersMax
+              idleTimeout
+              scalerType
+              scalerValue
+              flashBootType
+              templateId
+            }
+          }
+        `,
+        { input }
+      );
+
+      return jsonReply({
+        endpoint: data.saveEndpoint,
+        deployed: {
+          repo: `${listing.repoOwner}/${listing.repoName}`,
+          release: release.tagName,
+          hubReleaseId: release.id,
+          imageName: release.build.imageName,
+        },
+        note: `Endpoint created. Submit jobs with run-endpoint/runsync-endpoint using endpointId "${data.saveEndpoint.id}".`,
       });
     }
   );
