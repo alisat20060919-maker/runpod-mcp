@@ -337,7 +337,7 @@ export function registerHubTools(server: McpServer, rt: ToolRuntime): void {
         .string()
         .optional()
         .describe(
-          "Comma-separated GPU pool names for workers (e.g. 'ADA_24' or 'ADA_80_PRO,AMPERE_80'). Defaults to the release config's gpuIds; required when the config does not specify one."
+          "Comma-separated GPU pool names for workers (e.g. 'ADA_24' or 'ADA_80_PRO,AMPERE_80'). To pin specific GPU SKUs within a pool, append exclusions prefixed with '-' using GPU type ids from list-gpu-types (e.g. 'AMPERE_16,-NVIDIA RTX 2000 Ada Generation,-NVIDIA RTX A4500' allows only the pool's remaining SKUs). Defaults to the release config's gpuIds; required when the config does not specify one."
         ),
       gpuCount: z
         .number()
