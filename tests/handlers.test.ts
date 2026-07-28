@@ -2110,3 +2110,128 @@ describe('list-hub-repos (public GraphQL Hub catalog)', () => {
     assert.ok(pagination.nextCursor);
   });
 });
+
+// Public Endpoints (managed model APIs) share the public GraphQL path with the
+// Hub catalog. These pin the outbound query, the metadata parsing, the
+// live-only default, and the client-side filters.
+describe('list-public-endpoints (public GraphQL catalog)', () => {
+  const allAiApiPublicConfigs = [
+    {
+      id: 'cfg_kimi',
+      aiApiId: 'moonshot-kimi',
+      modelName: 'kimi-k3',
+      displayName: 'Kimi',
+      description: 'Advanced reasoning and chat.',
+      metadata:
+        '{"cost":4,"owner":"moonshot","source":"language","tag":"text-to-text","priceString":"$4.00 per 1m output tokens"}',
+      isLive: true,
+      createdAt: '2026-06-11T18:27:51.932Z',
+      updatedAt: '2026-07-27T20:45:41.152Z',
+    },
+    {
+      id: 'cfg_hailuo',
+      aiApiId: 'minimax-hailuo-2-3-fast',
+      modelName: 'minimax/hailuo-2-3',
+      displayName: 'Hailuo 2.3 Fast',
+      description: 'AI video generation.',
+      metadata:
+        '{"cost":0.19,"owner":"minimax","source":"video","tag":"image-to-video","priceString":"$0.19 per second"}',
+      isLive: true,
+      createdAt: '2026-05-08T20:58:56.912Z',
+      updatedAt: '2026-05-08T21:16:17.411Z',
+    },
+    {
+      id: 'cfg_dead',
+      aiApiId: 'legacy-model',
+      modelName: 'legacy/model',
+      displayName: 'Legacy Model',
+      description: 'Retired.',
+      metadata: 'not-json',
+      isLive: false,
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    },
+  ];
+  const jsonBody = { data: { allAiApiPublicConfigs } };
+
+  it('POSTs the allAiApiPublicConfigs query to the public GraphQL endpoint', async () => {
+    const { handlers, outbound } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({});
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[0].method, 'POST');
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.match(body.query, /allAiApiPublicConfigs/);
+    // live-only by default → the retired config is hidden
+    assert.equal((parseText(out).items as unknown[]).length, 2);
+  });
+
+  it('same GraphQL path under v2 (no REST home for public endpoints)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody });
+      await handlers.get('list-public-endpoints')!({});
+      assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    });
+  });
+
+  it('maps to compact output with parsed metadata (owner, modality, pricing) and the runtime baseUrl; sorted by display name', async () => {
+    const { handlers } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({});
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      items.map((i) => i.endpointId),
+      ['minimax-hailuo-2-3-fast', 'moonshot-kimi']
+    );
+    const kimi = items[1];
+    assert.equal(kimi.displayName, 'Kimi');
+    assert.equal(kimi.owner, 'moonshot');
+    assert.equal(kimi.modality, 'language');
+    assert.equal(kimi.pricing, '$4.00 per 1m output tokens');
+    assert.equal(kimi.baseUrl, 'https://api.runpod.ai/v2/moonshot-kimi');
+    // metadata JSON string must not leak through raw
+    assert.equal('metadata' in kimi, false);
+  });
+
+  it('includeOffline:true also lists non-live endpoints and survives malformed metadata', async () => {
+    const { handlers } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({
+      includeOffline: true,
+    });
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 3);
+    const legacy = items.find((i) => i.endpointId === 'legacy-model')!;
+    assert.equal(legacy.isLive, false);
+    // 'not-json' metadata → fields absent, no crash
+    assert.equal(legacy.owner, undefined);
+  });
+
+  it('filters client-side: searchTerm, modality, owner', async () => {
+    const run = async (params: Record<string, unknown>) => {
+      const { handlers } = harness({ jsonBody });
+      const out = await handlers.get('list-public-endpoints')!(params);
+      return (parseText(out).items as Array<{ endpointId: string }>).map(
+        (i) => i.endpointId
+      );
+    };
+    assert.deepEqual(await run({ searchTerm: 'kimi' }), ['moonshot-kimi']);
+    assert.deepEqual(await run({ searchTerm: 'image-to-video' }), [
+      'minimax-hailuo-2-3-fast',
+    ]);
+    assert.deepEqual(await run({ modality: 'video' }), [
+      'minimax-hailuo-2-3-fast',
+    ]);
+    assert.deepEqual(await run({ owner: 'moonshot' }), ['moonshot-kimi']);
+    assert.deepEqual(await run({ owner: 'nobody' }), []);
+  });
+
+  it('caps results with the shared pagination envelope', async () => {
+    const { handlers } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({ limit: 1 });
+    const payload = parseText(out);
+    assert.equal((payload.items as unknown[]).length, 1);
+    const pagination = payload.pagination as Record<string, unknown>;
+    assert.equal(pagination.total, 2);
+    assert.equal(pagination.truncated, true);
+    assert.ok(pagination.nextCursor);
+  });
+});

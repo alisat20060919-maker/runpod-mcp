@@ -6,6 +6,7 @@ import {
 } from './tools/runtime.js';
 import { registerCatalogTools } from './tools/catalog.js';
 import { registerHubTools } from './tools/hub.js';
+import { registerPublicEndpointTools } from './tools/public-endpoints.js';
 import { registerPodTools } from './tools/pods.js';
 import { registerEndpointTools } from './tools/endpoints.js';
 import { registerJobTools } from './tools/jobs.js';
@@ -39,6 +40,7 @@ export function registerTools(
 
   registerCatalogTools(server, rt);
   registerHubTools(server, rt);
+  registerPublicEndpointTools(server, rt);
   registerPodTools(server, rt);
   registerEndpointTools(server, rt);
   registerJobTools(server, rt);
