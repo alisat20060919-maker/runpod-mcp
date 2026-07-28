@@ -2514,3 +2514,142 @@ describe('deploy-hub-repo (authenticated GraphQL saveEndpoint)', () => {
     assert.match(parseText(noneOut).error as string, /repo .*or hubReleaseId/);
   });
 });
+
+// set-endpoint-gpus: reads the endpoint's current settings (call 1) and echoes
+// them into an authenticated saveEndpoint mutation with only the GPU fields
+// changed (call 2). The echo matters: saveEndpoint resets omitted endpoint
+// scalars to server defaults (verified live), so these tests pin that every
+// current value is carried over verbatim.
+describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
+  const endpoints = [
+    {
+      id: 'ep_pinme',
+      name: 'my-endpoint',
+      gpuIds: 'AMPERE_16',
+      gpuCount: 1,
+      workersMin: 2,
+      workersMax: 7,
+      idleTimeout: 42,
+      scalerType: 'REQUEST_COUNT',
+      scalerValue: 9,
+      executionTimeoutMs: 123000,
+      flashBootType: 'PRIORITY_FLASHBOOT',
+      type: 'QB',
+      locations: 'US-TX-3',
+      networkVolumeIds: [{ networkVolumeId: 'nv_1', dataCenterId: 'US-TX-3' }],
+    },
+    {
+      id: 'ep_plain',
+      name: 'plain-endpoint',
+      gpuIds: 'ADA_24',
+      gpuCount: 1,
+      workersMin: 0,
+      workersMax: 1,
+      idleTimeout: 5,
+      scalerType: 'QUEUE_DELAY',
+      scalerValue: 4,
+      executionTimeoutMs: 600000,
+      flashBootType: 'FLASHBOOT',
+      type: 'QB',
+      locations: null,
+      networkVolumeIds: [],
+    },
+  ];
+  const queryBody = { data: { myself: { endpoints } } };
+  const saveBody = {
+    data: {
+      saveEndpoint: {
+        id: 'ep_pinme',
+        name: 'my-endpoint',
+        gpuIds: 'AMPERE_16,-NVIDIA RTX A4500',
+        gpuCount: 1,
+        workersMin: 2,
+        workersMax: 7,
+      },
+    },
+  };
+
+  it('echoes every current endpoint scalar into the mutation, changing only gpuIds (both calls Bearer-authed)', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [queryBody, saveBody],
+    });
+    const out = await handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_pinme',
+      gpuIds: 'AMPERE_16,-NVIDIA RTX A4500',
+    });
+
+    assert.equal(outbound.length, 2);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[0].headers?.Authorization, 'Bearer rpa_test');
+    assert.match(JSON.parse(outbound[0].body!).query, /myself[\s\S]*endpoints/);
+    assert.equal(outbound[1].headers?.Authorization, 'Bearer rpa_test');
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.deepEqual(input, {
+      id: 'ep_pinme',
+      name: 'my-endpoint',
+      gpuIds: 'AMPERE_16,-NVIDIA RTX A4500',
+      gpuCount: 1,
+      workersMin: 2,
+      workersMax: 7,
+      idleTimeout: 42,
+      scalerType: 'REQUEST_COUNT',
+      scalerValue: 9,
+      executionTimeoutMs: 123000,
+      flashBootType: 'PRIORITY_FLASHBOOT',
+      type: 'QB',
+      locations: 'US-TX-3',
+      networkVolumeIds: [{ networkVolumeId: 'nv_1', dataCenterId: 'US-TX-3' }],
+    });
+    const payload = parseText(out);
+    assert.equal(payload.previousGpuIds, 'AMPERE_16');
+    assert.equal((payload.endpoint as { id: string }).id, 'ep_pinme');
+  });
+
+  it('builds the gpuIds string from pools + excludeGpuTypeIds; empty volume list echoes null; gpuCount overridable', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [queryBody, saveBody],
+    });
+    await handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_plain',
+      pools: ['AMPERE_16', 'AMPERE_24'],
+      excludeGpuTypeIds: ['NVIDIA RTX A4500', 'NVIDIA L4'],
+      gpuCount: 2,
+    });
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.equal(
+      input.gpuIds,
+      'AMPERE_16,AMPERE_24,-NVIDIA RTX A4500,-NVIDIA L4'
+    );
+    assert.equal(input.gpuCount, 2);
+    assert.equal(input.networkVolumeIds, null);
+    assert.equal(input.workersMax, 1);
+  });
+
+  it('fails BEFORE any mutation: unknown endpoint (after read), and missing GPU params (no calls at all)', async () => {
+    const unknown = harness({ jsonBodies: [queryBody] });
+    const unknownOut = await unknown.handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_nope',
+      gpuIds: 'ADA_24',
+    });
+    assert.equal(unknown.outbound.length, 1);
+    assert.match(
+      parseText(unknownOut).error as string,
+      /No Serverless endpoint/
+    );
+
+    const none = harness({ jsonBodies: [queryBody] });
+    const noneOut = await none.handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_pinme',
+    });
+    assert.equal(none.outbound.length, 0);
+    assert.match(parseText(noneOut).error as string, /gpuIds .*or pools/);
+  });
+});

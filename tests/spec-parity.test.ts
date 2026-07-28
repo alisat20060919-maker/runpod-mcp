@@ -160,6 +160,8 @@ const ALLOWLIST_UNMAPPED_TOOLS: Record<string, string> = {
     'Hub catalog is served by the public GraphQL endpoint; no v2 REST home yet',
   'deploy-hub-repo':
     'Hub deploys go through the authenticated GraphQL saveEndpoint mutation; no v2 REST home yet',
+  'set-endpoint-gpus':
+    'GPU SKU pinning is only expressible via the GraphQL saveEndpoint gpuIds string; no REST equivalent',
   'list-public-endpoints':
     'Public Endpoints catalog is served by the public GraphQL endpoint; no v2 REST home yet',
 };
