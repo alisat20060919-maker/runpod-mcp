@@ -7,7 +7,79 @@ import { READ_ONLY, WRITE, type ToolRuntime } from './runtime.js';
 // (api.runpod.ai/v2/{endpointId}/...). Distinct from endpoint CRUD.
 
 export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
-  const { jsonReply, serverlessRequest } = rt;
+  const { jsonReply, serverlessRequest, backendFor, callRestUrl } = rt;
+
+  // A job stuck IN_QUEUE has two very different causes that its status alone
+  // cannot distinguish: no host has the endpoint's GPU available (capacity),
+  // or a worker DID spin up and is crash-looping — the platform marks it
+  // UNHEALTHY while the job stays queued forever. Field experience shows
+  // agents (and humans) read the endless IN_QUEUE as "no capacity" and stop
+  // digging. So when get-job-status sees IN_QUEUE, it best-effort attaches the
+  // endpoint's worker summary and a plain-language hint pointing at the next
+  // diagnostic step. v2-only (the workers listing has no v1 REST home);
+  // never fails the status call itself.
+  interface WorkerSummary {
+    idle?: number;
+    initializing?: number;
+    running?: number;
+    throttled?: number;
+    total?: number;
+    unhealthy?: number;
+  }
+
+  async function diagnoseQueuedJob(
+    endpointId: string
+  ): Promise<{ workerHealth: WorkerSummary; hint: string } | null> {
+    try {
+      const backend = backendFor('workers');
+      if (backend.version !== 'v2') return null;
+      const raw = (await callRestUrl(
+        `${backend.base}/serverless/${endpointId}/workers`
+      )) as
+        | {
+            summary?: WorkerSummary;
+            workers?: Array<{ id: string; status?: string }>;
+          }
+        | undefined;
+      const summary = raw?.summary;
+      const workers = raw?.workers ?? [];
+      if (!summary) return null;
+
+      if ((summary.unhealthy ?? 0) > 0) {
+        const badIds = workers
+          .filter((w) => w.status === 'UNHEALTHY')
+          .map((w) => w.id)
+          .join(', ');
+        return {
+          workerHealth: summary,
+          hint: `${summary.unhealthy} of ${summary.total} worker(s) on this endpoint are UNHEALTHY — the container is likely crash-looping (repeated starts that exit before the handler runs). The job can stay IN_QUEUE indefinitely; this is a worker failure, NOT a capacity shortage. Inspect the logs with stream-worker-logs${
+            badIds ? ` (workerId: ${badIds})` : ''
+          }.`,
+        };
+      }
+      if ((summary.total ?? 0) === 0) {
+        return {
+          workerHealth: summary,
+          hint: 'No workers are scheduled for this endpoint — it is waiting for GPU capacity (or its GPU/CUDA constraints exclude the currently-available hosts). Check availability with list-gpu-types, or widen the gpuIds/CUDA settings.',
+        };
+      }
+      if ((summary.throttled ?? 0) > 0 && (summary.running ?? 0) === 0) {
+        return {
+          workerHealth: summary,
+          hint: 'Workers exist but are throttled — the hosts are at capacity right now; the job should start when capacity frees up.',
+        };
+      }
+      if ((summary.initializing ?? 0) > 0) {
+        return {
+          workerHealth: summary,
+          hint: 'A worker is initializing — likely a cold start (image pull / model load); the job should start soon.',
+        };
+      }
+      return { workerHealth: summary, hint: '' };
+    } catch {
+      return null; // diagnosis is best-effort — never break the status call
+    }
+  }
 
   // Shared schemas for serverless tools
   const endpointIdSchema = z
@@ -126,7 +198,7 @@ export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
   // Get Job Status
   server.tool(
     'get-job-status',
-    'Check the status of an asynchronous Serverless job. Returns the current status and output when complete. Job statuses: IN_QUEUE, IN_PROGRESS, COMPLETED, FAILED, CANCELLED, TIMED_OUT.',
+    'Check the status of an asynchronous Serverless job. Returns the current status and output when complete. Job statuses: IN_QUEUE, IN_PROGRESS, COMPLETED, FAILED, CANCELLED, TIMED_OUT. IMPORTANT: a job stuck IN_QUEUE does not necessarily mean a capacity shortage — a worker may have spun up and crash-looped (the platform marks it UNHEALTHY while the job stays queued). When the job is IN_QUEUE this tool attaches a workerHealth summary and a hint; to dig deeper, call list-endpoint-workers (look for UNHEALTHY) and stream-worker-logs.',
     {
       endpointId: endpointIdSchema.describe(
         'ID of the Serverless endpoint the job belongs to'
@@ -139,6 +211,21 @@ export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
         params.endpointId,
         `/status/${params.jobId}`
       );
+
+      if (
+        result &&
+        typeof result === 'object' &&
+        (result as { status?: string }).status === 'IN_QUEUE'
+      ) {
+        const diagnosis = await diagnoseQueuedJob(params.endpointId);
+        if (diagnosis) {
+          return jsonReply({
+            ...(result as Record<string, unknown>),
+            workerHealth: diagnosis.workerHealth,
+            ...(diagnosis.hint ? { hint: diagnosis.hint } : {}),
+          });
+        }
+      }
 
       return jsonReply(result);
     }
@@ -263,7 +350,7 @@ export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
   // Endpoint Health
   server.tool(
     'endpoint-health',
-    'Get the health and operational status of a Serverless endpoint, including worker counts and job statistics.',
+    'Get the health and operational status of a Serverless endpoint, including worker counts and job statistics. Use this when jobs are stuck IN_QUEUE: unhealthy workers mean a crash-looping container (a worker failure — inspect with stream-worker-logs), while zero workers means the endpoint is waiting for GPU capacity.',
     {
       endpointId: endpointIdSchema.describe(
         'ID of the Serverless endpoint to check health for'

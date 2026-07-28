@@ -1919,3 +1919,113 @@ describe('v1 catalog GraphQL uses the injected fetch (offline seam)', () => {
     assert.ok((parseText(out).items as unknown[]).length >= 1);
   });
 });
+
+// get-job-status queued-job diagnosis: a job stuck IN_QUEUE is ambiguous —
+// crash-looping (UNHEALTHY) workers and a capacity shortage look identical
+// from the job status alone. When the status is IN_QUEUE the tool attaches
+// the endpoint's worker summary + a hint (v2 only, best-effort). These pin
+// the trigger condition, the classification, and that the extra call never
+// breaks the status reply.
+describe('get-job-status — queued-job worker diagnosis', () => {
+  const queued = { id: 'j1', status: 'IN_QUEUE' };
+  const unhealthyWorkers = {
+    summary: {
+      idle: 0,
+      initializing: 0,
+      running: 0,
+      throttled: 0,
+      total: 1,
+      unhealthy: 1,
+    },
+    workers: [{ id: 'w_bad', status: 'UNHEALTHY' }],
+  };
+  const noWorkers = {
+    summary: {
+      idle: 0,
+      initializing: 0,
+      running: 0,
+      throttled: 0,
+      total: 0,
+      unhealthy: 0,
+    },
+    workers: [],
+  };
+
+  it('v2 + IN_QUEUE + UNHEALTHY worker → attaches workerHealth and a crash-loop hint naming the worker', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [queued, unhealthyWorkers],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.equal(outbound.length, 2);
+      assert.equal(outbound[0].url, 'https://api.runpod.ai/v2/ep/status/j1');
+      assert.equal(
+        outbound[1].url,
+        'https://v2-rest.runpod.io/v2/serverless/ep/workers'
+      );
+      const payload = parseText(out);
+      assert.equal(payload.status, 'IN_QUEUE');
+      assert.equal(
+        (payload.workerHealth as { unhealthy: number }).unhealthy,
+        1
+      );
+      assert.match(payload.hint as string, /crash-looping/);
+      assert.match(payload.hint as string, /NOT a capacity shortage/);
+      assert.match(payload.hint as string, /w_bad/);
+    });
+  });
+
+  it('v2 + IN_QUEUE + zero workers → capacity hint', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ jsonBodies: [queued, noWorkers] });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      const payload = parseText(out);
+      assert.match(payload.hint as string, /waiting for GPU capacity/);
+    });
+  });
+
+  it('terminal statuses skip the diagnosis entirely (one outbound call)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [{ id: 'j1', status: 'COMPLETED', output: {} }],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.equal(outbound.length, 1);
+      assert.equal('workerHealth' in parseText(out), false);
+    });
+  });
+
+  it('v1: no workers listing exists → status returned unchanged, no second call', async () => {
+    const { handlers, outbound } = harness({ jsonBodies: [queued] });
+    const out = await handlers.get('get-job-status')!({
+      endpointId: 'ep',
+      jobId: 'j1',
+    });
+    assert.equal(outbound.length, 1);
+    const payload = parseText(out);
+    assert.equal(payload.status, 'IN_QUEUE');
+    assert.equal('workerHealth' in payload, false);
+  });
+
+  it('an unrecognized workers response degrades to the plain status (no crash, no hint)', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ jsonBodies: [queued, { weird: true }] });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      const payload = parseText(out);
+      assert.equal(payload.status, 'IN_QUEUE');
+      assert.equal('workerHealth' in payload, false);
+    });
+  });
+});
