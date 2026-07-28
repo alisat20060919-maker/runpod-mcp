@@ -10,12 +10,19 @@ import { WRITE, type ToolRuntime } from './runtime.js';
 // pool, and '-'-prefixed GPU type ids (from list-gpu-types) exclude SKUs, so
 // a pool minus all-but-one SKU pins that SKU exactly.
 //
-// The saveEndpoint mutation is NOT a sparse update: omitted endpoint-level
-// scalars are reset to server defaults (verified live: an id+name+gpuIds-only
-// update reset workersMax 1→3 and idleTimeout 5→10, though the template was
-// preserved via templateId). So this tool reads the endpoint's current
-// settings first and echoes every endpoint-level field back with only gpuIds
-// (and optionally gpuCount) changed.
+// saveEndpoint is NOT a sparse update. Measured live with an
+// id+name+gpuIds-only update: workersMax 7→3, idleTimeout 42→10, scalerValue
+// 9→4 all reset to server defaults. Everything else held — including templateId,
+// the CUDA fields, compliance and modelReferences. So the reset set is narrower
+// than "every omitted field", but it is undocumented server behavior and could
+// widen, so this tool reads the endpoint and echoes every field back with only
+// gpuIds (and gpuCount) changed.
+//
+// Read shapes are not write shapes: networkVolumeIds reads as `NetworkVolumeIds`
+// (networkVolumeId + dataCenterId) but writes as `NetworkVolumeIdsInput`
+// (networkVolumeId ONLY), so echoing it verbatim gives `Field "dataCenterId" is
+// not defined by type "NetworkVolumeIdsInput"` and breaks every volume-bearing
+// endpoint.
 
 interface EndpointSnapshot {
   id: string;
@@ -31,6 +38,14 @@ interface EndpointSnapshot {
   flashBootType: string;
   type: string;
   locations: string | null;
+  templateId: string | null;
+  // A comma-separated String on read AND write, not a list.
+  allowedCudaVersions: string | null;
+  minCudaVersion: string | null;
+  // A [Compliance] ENUM on input, not [String] — the server rejects 'gdpr' and
+  // suggests 'GDPR'. Read values are already enum names: pass back verbatim.
+  compliance: string[] | null;
+  modelReferences: string[] | null;
   networkVolumeIds: Array<{
     networkVolumeId: string;
     dataCenterId: string | null;
@@ -115,6 +130,11 @@ export function registerEndpointGpuTools(
               flashBootType
               type
               locations
+              templateId
+              allowedCudaVersions
+              minCudaVersion
+              compliance
+              modelReferences
               networkVolumeIds {
                 networkVolumeId
                 dataCenterId
@@ -148,9 +168,26 @@ export function registerEndpointGpuTools(
         locations: current.locations,
         networkVolumeIds:
           current.networkVolumeIds && current.networkVolumeIds.length > 0
-            ? current.networkVolumeIds
+            ? // Drop dataCenterId: NetworkVolumeIdsInput takes networkVolumeId
+              // ONLY, and the read shape is rejected outright.
+              current.networkVolumeIds.map((v) => ({
+                networkVolumeId: v.networkVolumeId,
+              }))
             : null,
       };
+
+      // Echoed only when set. Omitting a field that currently reads null resets
+      // it to a default that is already null, while an explicit null risks a
+      // server-side type rejection for no gain.
+      for (const [key, value] of Object.entries({
+        templateId: current.templateId,
+        allowedCudaVersions: current.allowedCudaVersions,
+        minCudaVersion: current.minCudaVersion,
+        compliance: current.compliance,
+        modelReferences: current.modelReferences,
+      })) {
+        if (value !== null && value !== undefined) input[key] = value;
+      }
 
       interface SaveEndpointResponse {
         saveEndpoint: {
