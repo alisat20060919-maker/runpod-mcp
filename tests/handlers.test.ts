@@ -1082,7 +1082,10 @@ describe('catalog routing (B5)', () => {
       const out = (await handlers.get('list-gpu-types')!({
         includeAvailability: false,
       })) as { content: Array<{ text: string }> };
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/catalog/gpus');
+      assert.equal(
+        outbound[0].url,
+        'https://v2-rest.runpod.io/v2/catalog/gpus'
+      );
       // no availability data → nothing filtered out
       assert.equal(JSON.parse(out.content[0].text).items.length, 2);
     });
