@@ -5,6 +5,9 @@ import {
   type ToolDeps,
 } from './tools/runtime.js';
 import { registerCatalogTools } from './tools/catalog.js';
+import { registerHubTools } from './tools/hub.js';
+import { registerPublicEndpointTools } from './tools/public-endpoints.js';
+import { registerEndpointGpuTools } from './tools/endpoint-gpus.js';
 import { registerPodTools } from './tools/pods.js';
 import { registerEndpointTools } from './tools/endpoints.js';
 import { registerJobTools } from './tools/jobs.js';
@@ -36,8 +39,11 @@ export function registerTools(
   const rt = createToolRuntime(server, ctx, deps);
 
   registerCatalogTools(server, rt);
+  registerHubTools(server, rt);
+  registerPublicEndpointTools(server, rt);
   registerPodTools(server, rt);
   registerEndpointTools(server, rt);
+  registerEndpointGpuTools(server, rt);
   registerJobTools(server, rt);
   registerTemplateTools(server, rt);
   registerNetworkVolumeTools(server, rt);
