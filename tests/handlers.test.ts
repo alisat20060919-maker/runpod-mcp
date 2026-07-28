@@ -33,6 +33,7 @@ interface OutboundRecord {
   url: string;
   method: string;
   body?: string;
+  headers?: Record<string, string>;
 }
 
 function harness(opts?: {
@@ -71,7 +72,12 @@ function harness(opts?: {
     url: string,
     init: { method: string; headers: Record<string, string>; body?: string }
   ) => {
-    outbound.push({ url, method: init.method, body: init.body });
+    outbound.push({
+      url,
+      method: init.method,
+      body: init.body,
+      headers: init.headers,
+    });
     const jsonBody = queue
       ? (queue.shift() ?? opts?.jsonBody ?? [])
       : (opts?.jsonBody ?? []);
@@ -1978,6 +1984,851 @@ describe('get-job-status — queued-job worker diagnosis', () => {
       assert.equal(payload.status, 'IN_QUEUE');
       assert.equal('workerHealth' in payload, false);
     });
+  });
+});
+
+// Hub listings are served by the same public GraphQL path as the v1 catalog,
+// on BOTH v1 and v2 (no REST home for the Hub yet). These pin the outbound
+// query shape, the client-side filters, and the compact mapped output.
+describe('list-hub-repos (public GraphQL Hub catalog)', () => {
+  const listings = [
+    {
+      id: 'lst_vllm',
+      repoId: '1',
+      title: 'vLLM',
+      description: 'OpenAI-compatible LLM endpoints',
+      repoName: 'worker-vllm',
+      repoOwner: 'runpod-workers',
+      createdAt: '2025-03-20T07:03:50.990Z',
+      updatedAt: '2026-07-28T15:34:28.240Z',
+      views: 1560,
+      stars: 460,
+      deploys: 41921,
+      language: 'Python',
+      category: 'language',
+      tags: ['llm', 'vllm'],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_vllm',
+        name: 'v2.22.5',
+        tagName: 'v2.22.5',
+        createdAt: '2026-06-26T18:48:13.000Z',
+        config: '{"runsOn":"GPU","containerDiskInGb":150}',
+        build: {
+          id: 'b1',
+          imageName: 'registry.runpod.net/worker-vllm:9e1c48313',
+        },
+      },
+    },
+    {
+      id: 'lst_comfy',
+      repoId: '2',
+      title: 'ComfyUI',
+      description: 'Generate images with ComfyUI',
+      repoName: 'worker-comfyui',
+      repoOwner: 'runpod-workers',
+      createdAt: '2025-03-12T15:26:43.567Z',
+      updatedAt: '2026-07-28T15:34:33.647Z',
+      views: 425,
+      stars: 721,
+      deploys: 13198,
+      language: 'Python',
+      category: 'image',
+      tags: ['comfyui', 'stable-diffusion'],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_comfy',
+        name: '5.8.6',
+        tagName: '5.8.6',
+        createdAt: '2026-06-17T08:16:31.000Z',
+        config: '{"runsOn":"GPU","containerDiskInGb":20}',
+        build: {
+          id: 'b2',
+          imageName: 'registry.runpod.net/worker-comfyui:066a11c49',
+        },
+      },
+    },
+    {
+      id: 'lst_axolotl',
+      repoId: '3',
+      title: 'Axolotl Fine-Tuning',
+      description: 'Serverless fine-tuning of open-source LLMs',
+      repoName: 'axolotl',
+      repoOwner: 'axolotl-ai-cloud',
+      createdAt: '2025-05-01T00:00:00.000Z',
+      updatedAt: '2026-07-01T00:00:00.000Z',
+      views: 100,
+      stars: 9000,
+      deploys: 500,
+      language: 'Python',
+      category: 'language',
+      tags: ['fine-tuning', 'lora'],
+      type: 'SERVERLESS',
+      listedRelease: null,
+    },
+  ];
+
+  it('POSTs the listings query to the public GraphQL endpoint (works on v1 and v2, no auth path)', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: { data: { listings } },
+    });
+    const out = await handlers.get('list-hub-repos')!({});
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[0].method, 'POST');
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.match(body.query, /listings\(input: \{\}\)/);
+    assert.match(body.query, /listedRelease/);
+    // config is large — must NOT be requested unless includeConfig is set.
+    assert.doesNotMatch(body.query, /\bconfig\b/);
+    assert.equal((parseText(out).items as unknown[]).length, 3);
+  });
+
+  it('same GraphQL path under v2 (no REST home for the Hub)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBody: { data: { listings } },
+      });
+      await handlers.get('list-hub-repos')!({});
+      assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    });
+  });
+
+  it('maps to compact output: repo, urls, and the deploy-critical hubReleaseId + imageName; sorted most-deployed first', async () => {
+    const { handlers } = harness({ jsonBody: { data: { listings } } });
+    const out = await handlers.get('list-hub-repos')!({});
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      items.map((i) => i.repo),
+      [
+        'runpod-workers/worker-vllm',
+        'runpod-workers/worker-comfyui',
+        'axolotl-ai-cloud/axolotl',
+      ]
+    );
+    const vllm = items[0];
+    assert.equal(
+      vllm.hubUrl,
+      'https://console.runpod.io/hub/runpod-workers/worker-vllm'
+    );
+    assert.equal(
+      vllm.githubUrl,
+      'https://github.com/runpod-workers/worker-vllm'
+    );
+    const release = vllm.listedRelease as Record<string, unknown>;
+    assert.equal(release.hubReleaseId, 'rel_vllm');
+    assert.equal(
+      release.imageName,
+      'registry.runpod.net/worker-vllm:9e1c48313'
+    );
+    assert.equal('config' in release, false);
+    // A listing without a listed release maps to null, not a crash.
+    assert.equal(items[2].listedRelease, null);
+  });
+
+  it('filters client-side: searchTerm (title/tags), category, repoOwner, type', async () => {
+    const run = async (params: Record<string, unknown>) => {
+      const { handlers } = harness({ jsonBody: { data: { listings } } });
+      const out = await handlers.get('list-hub-repos')!(params);
+      return (parseText(out).items as Array<{ repo: string }>).map(
+        (i) => i.repo
+      );
+    };
+    assert.deepEqual(await run({ searchTerm: 'comfy' }), [
+      'runpod-workers/worker-comfyui',
+    ]);
+    assert.deepEqual(await run({ searchTerm: 'LoRA' }), [
+      'axolotl-ai-cloud/axolotl',
+    ]);
+    assert.deepEqual(await run({ category: 'image' }), [
+      'runpod-workers/worker-comfyui',
+    ]);
+    assert.deepEqual(await run({ repoOwner: 'axolotl-ai-cloud' }), [
+      'axolotl-ai-cloud/axolotl',
+    ]);
+    assert.deepEqual((await run({ type: 'SERVERLESS' })).length, 3);
+    assert.deepEqual(await run({ type: 'POD' }), []);
+  });
+
+  it('includeConfig:true requests config in the query and returns it parsed', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: { data: { listings } },
+    });
+    const out = await handlers.get('list-hub-repos')!({
+      includeConfig: true,
+      searchTerm: 'vllm',
+    });
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.match(body.query, /\bconfig\b/);
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    const release = items[0].listedRelease as Record<string, unknown>;
+    assert.deepEqual(release.config, { runsOn: 'GPU', containerDiskInGb: 150 });
+  });
+
+  it('caps results with the shared pagination envelope', async () => {
+    const { handlers } = harness({ jsonBody: { data: { listings } } });
+    const out = await handlers.get('list-hub-repos')!({ limit: 1 });
+    const payload = parseText(out);
+    assert.equal((payload.items as unknown[]).length, 1);
+    const pagination = payload.pagination as Record<string, unknown>;
+    assert.equal(pagination.total, 3);
+    assert.equal(pagination.truncated, true);
+    assert.ok(pagination.nextCursor);
+  });
+
+  it('orders deploy-count ties deterministically, so paging cannot skip or duplicate', async () => {
+    // Each page re-fetches the whole catalog and `listings(input: {})` promises
+    // no order, so sorting on `deploys` alone lets ties move between requests
+    // and page 2 re-shows or skips entries. Same listings in a different input
+    // order must yield the same page.
+    const tied = [
+      { ...listings[0], id: 'l_c', repoName: 'c', deploys: 0 },
+      { ...listings[0], id: 'l_a', repoName: 'a', deploys: 0 },
+      { ...listings[0], id: 'l_b', repoName: 'b', deploys: 0 },
+    ];
+    const order = async (input: typeof tied) => {
+      const { handlers } = harness({ jsonBody: { data: { listings: input } } });
+      const out = await handlers.get('list-hub-repos')!({});
+      return (parseText(out).items as Array<{ id: string }>).map((i) => i.id);
+    };
+
+    const first = await order(tied);
+    const reversed = await order([...tied].reverse());
+    assert.deepEqual(first, ['l_a', 'l_b', 'l_c']);
+    assert.deepEqual(reversed, first);
+  });
+});
+
+// Public Endpoints (managed model APIs) share the public GraphQL path with the
+// Hub catalog. These pin the outbound query, the metadata parsing, the
+// live-only default, and the client-side filters.
+describe('list-public-endpoints (public GraphQL catalog)', () => {
+  const allAiApiPublicConfigs = [
+    {
+      id: 'cfg_kimi',
+      aiApiId: 'moonshot-kimi',
+      modelName: 'kimi-k3',
+      displayName: 'Kimi',
+      description: 'Advanced reasoning and chat.',
+      metadata:
+        '{"cost":4,"owner":"moonshot","source":"language","tag":"text-to-text","priceString":"$4.00 per 1m output tokens"}',
+      isLive: true,
+      createdAt: '2026-06-11T18:27:51.932Z',
+      updatedAt: '2026-07-27T20:45:41.152Z',
+    },
+    {
+      id: 'cfg_hailuo',
+      aiApiId: 'minimax-hailuo-2-3-fast',
+      modelName: 'minimax/hailuo-2-3',
+      displayName: 'Hailuo 2.3 Fast',
+      description: 'AI video generation.',
+      metadata:
+        '{"cost":0.19,"owner":"minimax","source":"video","tag":"image-to-video","priceString":"$0.19 per second"}',
+      isLive: true,
+      createdAt: '2026-05-08T20:58:56.912Z',
+      updatedAt: '2026-05-08T21:16:17.411Z',
+    },
+    {
+      id: 'cfg_dead',
+      aiApiId: 'legacy-model',
+      modelName: 'legacy/model',
+      displayName: 'Legacy Model',
+      description: 'Retired.',
+      metadata: 'not-json',
+      isLive: false,
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+    },
+  ];
+  const jsonBody = { data: { allAiApiPublicConfigs } };
+
+  it('POSTs the allAiApiPublicConfigs query to the public GraphQL endpoint', async () => {
+    const { handlers, outbound } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({});
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[0].method, 'POST');
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.match(body.query, /allAiApiPublicConfigs/);
+    // live-only by default → the retired config is hidden
+    assert.equal((parseText(out).items as unknown[]).length, 2);
+  });
+
+  it('same GraphQL path under v2 (no REST home for public endpoints)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody });
+      await handlers.get('list-public-endpoints')!({});
+      assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    });
+  });
+
+  it('maps to compact output with parsed metadata (owner, modality, pricing) and the runtime baseUrl; sorted by display name', async () => {
+    const { handlers } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({});
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      items.map((i) => i.endpointId),
+      ['minimax-hailuo-2-3-fast', 'moonshot-kimi']
+    );
+    const kimi = items[1];
+    assert.equal(kimi.displayName, 'Kimi');
+    assert.equal(kimi.owner, 'moonshot');
+    assert.equal(kimi.modality, 'language');
+    assert.equal(kimi.pricing, '$4.00 per 1m output tokens');
+    assert.equal(kimi.baseUrl, 'https://api.runpod.ai/v2/moonshot-kimi');
+    // metadata JSON string must not leak through raw
+    assert.equal('metadata' in kimi, false);
+  });
+
+  it('includeOffline:true also lists non-live endpoints and survives malformed metadata', async () => {
+    const { handlers } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({
+      includeOffline: true,
+    });
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 3);
+    const legacy = items.find((i) => i.endpointId === 'legacy-model')!;
+    assert.equal(legacy.isLive, false);
+    // 'not-json' metadata → fields absent, no crash
+    assert.equal(legacy.owner, undefined);
+  });
+
+  it('filters client-side: searchTerm, modality, owner', async () => {
+    const run = async (params: Record<string, unknown>) => {
+      const { handlers } = harness({ jsonBody });
+      const out = await handlers.get('list-public-endpoints')!(params);
+      return (parseText(out).items as Array<{ endpointId: string }>).map(
+        (i) => i.endpointId
+      );
+    };
+    assert.deepEqual(await run({ searchTerm: 'kimi' }), ['moonshot-kimi']);
+    assert.deepEqual(await run({ searchTerm: 'image-to-video' }), [
+      'minimax-hailuo-2-3-fast',
+    ]);
+    assert.deepEqual(await run({ modality: 'video' }), [
+      'minimax-hailuo-2-3-fast',
+    ]);
+    assert.deepEqual(await run({ owner: 'moonshot' }), ['moonshot-kimi']);
+    assert.deepEqual(await run({ owner: 'nobody' }), []);
+  });
+
+  it('caps results with the shared pagination envelope', async () => {
+    const { handlers } = harness({ jsonBody });
+    const out = await handlers.get('list-public-endpoints')!({ limit: 1 });
+    const payload = parseText(out);
+    assert.equal((payload.items as unknown[]).length, 1);
+    const pagination = payload.pagination as Record<string, unknown>;
+    assert.equal(pagination.total, 2);
+    assert.equal(pagination.truncated, true);
+    assert.ok(pagination.nextCursor);
+  });
+});
+
+// deploy-hub-repo: resolves the release from the public catalog (call 1), then
+// submits the authenticated saveEndpoint mutation with variables (call 2).
+// These pin the mutation input the console builds — hubReleaseId, config-derived
+// hardware, env defaults + overrides — and the guard rails that fail BEFORE any
+// mutation is sent.
+describe('deploy-hub-repo (authenticated GraphQL saveEndpoint)', () => {
+  const catalogListings = [
+    {
+      id: 'lst_vllm',
+      repoId: '1',
+      title: 'vLLM',
+      description: 'LLM endpoints',
+      repoName: 'worker-vllm',
+      repoOwner: 'runpod-workers',
+      createdAt: '2025-03-20T07:03:50.990Z',
+      updatedAt: '2026-07-28T15:34:28.240Z',
+      views: 1,
+      stars: 1,
+      deploys: 100,
+      language: 'Python',
+      category: 'language',
+      tags: ['llm'],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_vllm',
+        name: 'v2.22.5',
+        tagName: 'v2.22.5',
+        createdAt: '2026-06-26T18:48:13.000Z',
+        config: JSON.stringify({
+          runsOn: 'GPU',
+          containerDiskInGb: 150,
+          gpuIds: 'ADA_80_PRO,AMPERE_80',
+          gpuCount: 1,
+          allowedCudaVersions: ['12.8', '12.4', '12.6'],
+          env: [
+            {
+              key: 'MODEL_NAME',
+              input: { type: 'huggingface', required: true },
+            },
+            { key: 'MAX_NUM_SEQS', input: { type: 'number', default: 256 } },
+            {
+              key: 'TRUST_REMOTE_CODE',
+              input: {
+                type: 'boolean',
+                default: false,
+                trueValue: '1',
+                falseValue: '0',
+              },
+            },
+            { key: 'TOKENIZER', input: { type: 'string', default: '' } },
+          ],
+        }),
+        build: { id: 'b1', imageName: 'registry.runpod.net/worker-vllm:9e1' },
+      },
+    },
+    {
+      id: 'lst_pod',
+      repoId: '2',
+      title: 'Some Pod Thing',
+      description: 'pod listing',
+      repoName: 'pod-thing',
+      repoOwner: 'someone',
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+      views: 0,
+      stars: 0,
+      deploys: 0,
+      language: 'Python',
+      category: 'image',
+      tags: [],
+      type: 'POD',
+      listedRelease: {
+        id: 'rel_pod',
+        name: '1.0',
+        tagName: '1.0',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        config: '{}',
+        build: { id: 'b2', imageName: 'registry.runpod.net/pod-thing:abc' },
+      },
+    },
+    {
+      id: 'lst_nogpu',
+      repoId: '3',
+      title: 'No GPU Config',
+      description: 'config without gpuIds',
+      repoName: 'no-gpu',
+      repoOwner: 'someone',
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+      views: 0,
+      stars: 0,
+      deploys: 0,
+      language: 'Python',
+      category: 'language',
+      tags: [],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_nogpu',
+        name: '1.0',
+        tagName: '1.0',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        config: '{"containerDiskInGb":200,"env":[]}',
+        build: { id: 'b3', imageName: 'registry.runpod.net/no-gpu:abc' },
+      },
+    },
+  ];
+  const catalogBody = { data: { listings: catalogListings } };
+  const saveBody = {
+    data: {
+      saveEndpoint: {
+        id: 'ep_new',
+        name: 'vLLM v2.22.5',
+        gpuIds: 'ADA_80_PRO,AMPERE_80',
+        gpuCount: 1,
+        workersMin: 0,
+        workersMax: 3,
+        idleTimeout: 5,
+        scalerType: 'QUEUE_DELAY',
+        scalerValue: 4,
+        flashBootType: 'FLASHBOOT',
+        templateId: 'tpl_new',
+      },
+    },
+  };
+
+  it('happy path (by repo): catalog query then authenticated saveEndpoint with the console-shaped input', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [catalogBody, saveBody],
+    });
+    const out = await handlers.get('deploy-hub-repo')!({
+      repo: 'runpod-workers/worker-vllm',
+      env: { MODEL_NAME: 'openai/gpt-oss-20b', EXTRA_FLAG: 'yes' },
+    });
+
+    assert.equal(outbound.length, 2);
+    // Call 1: public catalog resolution (query with config, no bearer auth).
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.match(
+      JSON.parse(outbound[0].body!).query,
+      /listings\(input: \{\}\)/
+    );
+    assert.equal('Authorization' in (outbound[0].headers ?? {}), false);
+    // Call 2: authenticated mutation with variables.
+    assert.equal(outbound[1].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[1].headers?.Authorization, 'Bearer rpa_test');
+    const body = JSON.parse(outbound[1].body!) as {
+      query: string;
+      variables: { input: Record<string, unknown> };
+    };
+    assert.match(
+      body.query,
+      /mutation saveEndpoint\(\$input: EndpointInput!\)/
+    );
+    const input = body.variables.input;
+    assert.equal(input.hubReleaseId, 'rel_vllm');
+    assert.equal(input.name, 'vLLM v2.22.5');
+    assert.equal(input.type, 'QB');
+    assert.equal(input.gpuIds, 'ADA_80_PRO,AMPERE_80');
+    assert.equal(input.gpuCount, 1);
+    assert.equal(input.workersMin, 0);
+    assert.equal(input.workersMax, null);
+    assert.equal(input.idleTimeout, 5);
+    assert.equal(input.scalerType, 'QUEUE_DELAY');
+    assert.equal(input.scalerValue, 4);
+    assert.equal(input.executionTimeoutMs, 600000);
+    assert.equal(input.flashBootType, 'FLASHBOOT');
+    // min of ['12.8','12.4','12.6'] numeric-aware, list joined verbatim.
+    assert.equal(input.minCudaVersion, '12.4');
+    assert.equal(input.allowedCudaVersions, '12.8,12.4,12.6');
+    const template = input.template as Record<string, unknown>;
+    assert.equal(template.imageName, 'registry.runpod.net/worker-vllm:9e1');
+    assert.equal(template.containerDiskInGb, 150);
+    assert.match(
+      String(template.name),
+      /^vLLM v2\.22\.5__template__[a-z0-9]+$/
+    );
+    // Env: schema defaults + overrides + passthrough of unknown keys; booleans
+    // serialized through trueValue/falseValue.
+    assert.deepEqual(template.env, [
+      { key: 'MODEL_NAME', value: 'openai/gpt-oss-20b' },
+      { key: 'MAX_NUM_SEQS', value: '256' },
+      { key: 'TRUST_REMOTE_CODE', value: '0' },
+      { key: 'TOKENIZER', value: '' },
+      { key: 'EXTRA_FLAG', value: 'yes' },
+    ]);
+    // Reply carries the new endpoint and what was deployed.
+    const payload = parseText(out);
+    assert.equal((payload.endpoint as { id: string }).id, 'ep_new');
+    assert.equal(
+      (payload.deployed as { hubReleaseId: string }).hubReleaseId,
+      'rel_vllm'
+    );
+  });
+
+  it('resolves by hubReleaseId and honors overrides (name, gpu, workers, disk, flashboot)', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [catalogBody, saveBody],
+    });
+    await handlers.get('deploy-hub-repo')!({
+      hubReleaseId: 'rel_vllm',
+      name: 'my-vllm',
+      env: { MODEL_NAME: 'm' },
+      gpuIds: 'AMPERE_80',
+      gpuCount: 2,
+      containerDiskInGb: 300,
+      workersMin: 1,
+      workersMax: 5,
+      idleTimeout: 30,
+      scalerType: 'REQUEST_COUNT',
+      scalerValue: 2,
+      executionTimeoutMs: 900000,
+      flashboot: 'OFF',
+    });
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.equal(input.hubReleaseId, 'rel_vllm');
+    assert.equal(input.name, 'my-vllm');
+    assert.equal(input.gpuIds, 'AMPERE_80');
+    assert.equal(input.gpuCount, 2);
+    assert.equal(input.workersMin, 1);
+    assert.equal(input.workersMax, 5);
+    assert.equal(input.idleTimeout, 30);
+    assert.equal(input.scalerType, 'REQUEST_COUNT');
+    assert.equal(input.scalerValue, 2);
+    assert.equal(input.executionTimeoutMs, 900000);
+    assert.equal(input.flashBootType, 'OFF');
+    assert.equal(
+      (input.template as Record<string, unknown>).containerDiskInGb,
+      300
+    );
+  });
+
+  it('fails BEFORE the mutation: missing required env vars', async () => {
+    const { handlers, outbound } = harness({ jsonBodies: [catalogBody] });
+    const out = await handlers.get('deploy-hub-repo')!({
+      repo: 'runpod-workers/worker-vllm',
+    });
+    assert.equal(outbound.length, 1); // catalog only, no mutation
+    assert.match(parseText(out).error as string, /MODEL_NAME/);
+  });
+
+  it('fails BEFORE the mutation: no gpuIds in config and none provided', async () => {
+    const { handlers, outbound } = harness({ jsonBodies: [catalogBody] });
+    const out = await handlers.get('deploy-hub-repo')!({
+      repo: 'someone/no-gpu',
+    });
+    assert.equal(outbound.length, 1);
+    assert.match(parseText(out).error as string, /gpuIds/);
+  });
+
+  it('fails BEFORE the mutation: POD listings, unknown repos, and missing identifiers', async () => {
+    const pod = harness({ jsonBodies: [catalogBody] });
+    const podOut = await pod.handlers.get('deploy-hub-repo')!({
+      repo: 'someone/pod-thing',
+    });
+    assert.match(parseText(podOut).error as string, /only SERVERLESS/);
+
+    const unknown = harness({ jsonBodies: [catalogBody] });
+    const unknownOut = await unknown.handlers.get('deploy-hub-repo')!({
+      repo: 'nobody/nothing',
+    });
+    assert.match(parseText(unknownOut).error as string, /No Hub listing/);
+
+    const none = harness({ jsonBodies: [catalogBody] });
+    const noneOut = await none.handlers.get('deploy-hub-repo')!({});
+    assert.equal(none.outbound.length, 0); // no calls at all
+    assert.match(parseText(noneOut).error as string, /repo .*or hubReleaseId/);
+  });
+});
+
+// set-endpoint-gpus: reads the endpoint's current settings (call 1) and echoes
+// them into an authenticated saveEndpoint mutation with only the GPU fields
+// changed (call 2). The echo matters: saveEndpoint resets omitted endpoint
+// scalars to server defaults (verified live), so these tests pin that every
+// current value is carried over verbatim.
+//
+// Assertions are derived FROM the fixture, not from a copy of the
+// implementation's object literal. A hand-copied expectation is a
+// change-detector that passes when a field is missing from both sides at once —
+// exactly how templateId/minCudaVersion/allowedCudaVersions/compliance/
+// modelReferences went unnoticed. `preservedKeys` is the real contract: add a
+// field to the fixture and the test demands it be echoed.
+describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
+  const endpoints = [
+    {
+      id: 'ep_pinme',
+      name: 'my-endpoint',
+      gpuIds: 'AMPERE_16',
+      gpuCount: 1,
+      workersMin: 2,
+      workersMax: 7,
+      idleTimeout: 42,
+      scalerType: 'REQUEST_COUNT',
+      scalerValue: 9,
+      executionTimeoutMs: 123000,
+      flashBootType: 'PRIORITY_FLASHBOOT',
+      type: 'QB',
+      locations: 'US-TX-3',
+      templateId: 'tpl_pinme',
+      allowedCudaVersions: '12.4,12.8',
+      minCudaVersion: '12.4',
+      compliance: ['GDPR'],
+      modelReferences: ['model_a'],
+      networkVolumeIds: [{ networkVolumeId: 'nv_1', dataCenterId: 'US-TX-3' }],
+    },
+    {
+      id: 'ep_plain',
+      name: 'plain-endpoint',
+      gpuIds: 'ADA_24',
+      gpuCount: 1,
+      workersMin: 0,
+      workersMax: 1,
+      idleTimeout: 5,
+      scalerType: 'QUEUE_DELAY',
+      scalerValue: 4,
+      executionTimeoutMs: 600000,
+      flashBootType: 'FLASHBOOT',
+      type: 'QB',
+      locations: null,
+      templateId: 'tpl_plain',
+      // No CUDA constraint or tags on this endpoint: these read null.
+      allowedCudaVersions: null,
+      minCudaVersion: null,
+      compliance: null,
+      modelReferences: null,
+      networkVolumeIds: [],
+    },
+  ];
+  // Fixture keys that must survive the echo unchanged. gpuIds is the one field
+  // the tool replaces; networkVolumeIds is asserted separately because read and
+  // write use different shapes.
+  const preservedKeys = Object.keys(endpoints[0]).filter(
+    (k) => k !== 'gpuIds' && k !== 'networkVolumeIds'
+  );
+  const queryBody = { data: { myself: { endpoints } } };
+  const saveBody = {
+    data: {
+      saveEndpoint: {
+        id: 'ep_pinme',
+        name: 'my-endpoint',
+        gpuIds: 'AMPERE_16,-NVIDIA RTX A4500',
+        gpuCount: 1,
+        workersMin: 2,
+        workersMax: 7,
+      },
+    },
+  };
+
+  it('echoes every current endpoint scalar into the mutation, changing only gpuIds (both calls Bearer-authed)', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [queryBody, saveBody],
+    });
+    const out = await handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_pinme',
+      gpuIds: 'AMPERE_16,-NVIDIA RTX A4500',
+    });
+
+    assert.equal(outbound.length, 2);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[0].headers?.Authorization, 'Bearer rpa_test');
+    assert.match(JSON.parse(outbound[0].body!).query, /myself[\s\S]*endpoints/);
+    assert.equal(outbound[1].headers?.Authorization, 'Bearer rpa_test');
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    // Every preserved key must be echoed with the value the read returned.
+    for (const key of preservedKeys) {
+      assert.deepEqual(
+        input[key],
+        (endpoints[0] as Record<string, unknown>)[key],
+        `${key} must be echoed back unchanged (saveEndpoint resets omitted fields)`
+      );
+    }
+    assert.equal(input.gpuIds, 'AMPERE_16,-NVIDIA RTX A4500');
+    // NetworkVolumeIdsInput accepts networkVolumeId ONLY; the server rejects
+    // dataCenterId outright, breaking every endpoint with a volume. So assert
+    // the exact key set, not just the id.
+    assert.deepEqual(input.networkVolumeIds, [{ networkVolumeId: 'nv_1' }]);
+    for (const entry of input.networkVolumeIds as Array<
+      Record<string, unknown>
+    >) {
+      assert.deepEqual(
+        Object.keys(entry),
+        ['networkVolumeId'],
+        'NetworkVolumeIdsInput accepts networkVolumeId only'
+      );
+    }
+    // No stray fields beyond the echo + the GPU change.
+    assert.deepEqual(
+      Object.keys(input).sort(),
+      [...preservedKeys, 'gpuIds', 'networkVolumeIds'].sort()
+    );
+    const payload = parseText(out);
+    assert.equal(payload.previousGpuIds, 'AMPERE_16');
+    assert.equal((payload.endpoint as { id: string }).id, 'ep_pinme');
+  });
+
+  it('minCudaVersion/allowedCudaVersions are overridable and otherwise echo the current values', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [queryBody, saveBody],
+    });
+    await handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_pinme',
+      gpuIds: 'AMPERE_16',
+      minCudaVersion: '12.0',
+      allowedCudaVersions: '12.8,12.7,12.6,12.5,12.4',
+    });
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.equal(input.minCudaVersion, '12.0');
+    assert.equal(input.allowedCudaVersions, '12.8,12.7,12.6,12.5,12.4');
+  });
+
+  it('builds the gpuIds string from pools + excludeGpuTypeIds; empty volume list echoes null; gpuCount overridable', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [queryBody, saveBody],
+    });
+    await handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_plain',
+      pools: ['AMPERE_16', 'AMPERE_24'],
+      excludeGpuTypeIds: ['NVIDIA RTX A4500', 'NVIDIA L4'],
+      gpuCount: 2,
+    });
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.equal(
+      input.gpuIds,
+      'AMPERE_16,AMPERE_24,-NVIDIA RTX A4500,-NVIDIA L4'
+    );
+    assert.equal(input.gpuCount, 2);
+    assert.equal(input.networkVolumeIds, null);
+    assert.equal(input.workersMax, 1);
+    // ep_plain has a template but no CUDA constraint, tags or model references:
+    // the template is carried over, the null fields omitted rather than sent as
+    // explicit nulls.
+    assert.equal(input.templateId, 'tpl_plain');
+    for (const key of [
+      'allowedCudaVersions',
+      'minCudaVersion',
+      'compliance',
+      'modelReferences',
+    ]) {
+      assert.equal(key in input, false, `${key} is null — omit, do not send`);
+    }
+  });
+
+  it('sends the authenticated GraphQL host, not the public-discovery one', async () => {
+    // The API key must not follow RUNPOD_PUBLIC_GRAPHQL_URL — the documented
+    // credential-free discovery override, freely pointed at stubs.
+    const prevPublic = process.env.RUNPOD_PUBLIC_GRAPHQL_URL;
+    const prevAuthed = process.env.RUNPOD_AUTHED_GRAPHQL_URL;
+    process.env.RUNPOD_PUBLIC_GRAPHQL_URL = 'https://public.stub/graphql';
+    process.env.RUNPOD_AUTHED_GRAPHQL_URL = 'https://authed.example/graphql';
+    try {
+      const { handlers, outbound } = harness({
+        jsonBodies: [queryBody, saveBody],
+      });
+      await handlers.get('set-endpoint-gpus')!({
+        endpointId: 'ep_pinme',
+        gpuIds: 'ADA_24',
+      });
+      for (const call of outbound) {
+        assert.equal(call.url, 'https://authed.example/graphql');
+        assert.equal(call.headers?.Authorization, 'Bearer rpa_test');
+      }
+    } finally {
+      if (prevPublic === undefined)
+        delete process.env.RUNPOD_PUBLIC_GRAPHQL_URL;
+      else process.env.RUNPOD_PUBLIC_GRAPHQL_URL = prevPublic;
+      if (prevAuthed === undefined)
+        delete process.env.RUNPOD_AUTHED_GRAPHQL_URL;
+      else process.env.RUNPOD_AUTHED_GRAPHQL_URL = prevAuthed;
+    }
+  });
+
+  it('fails BEFORE any mutation: unknown endpoint (after read), and missing GPU params (no calls at all)', async () => {
+    const unknown = harness({ jsonBodies: [queryBody] });
+    const unknownOut = await unknown.handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_nope',
+      gpuIds: 'ADA_24',
+    });
+    assert.equal(unknown.outbound.length, 1);
+    assert.match(
+      parseText(unknownOut).error as string,
+      /No Serverless endpoint/
+    );
+
+    const none = harness({ jsonBodies: [queryBody] });
+    const noneOut = await none.handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_pinme',
+    });
+    assert.equal(none.outbound.length, 0);
+    assert.match(parseText(noneOut).error as string, /gpuIds .*or pools/);
   });
 });
 

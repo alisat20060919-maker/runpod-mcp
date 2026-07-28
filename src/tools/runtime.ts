@@ -9,6 +9,7 @@ import {
   restV1Base,
   serverlessBase,
   publicGraphqlBase,
+  authedGraphqlBase,
   type Env,
   type Backend,
   type Resource,
@@ -25,9 +26,10 @@ import {
 // Base URLs are resolved LIVE per call (via restV1Base/serverlessBase/
 // publicGraphqlBase reading process.env), not frozen at module import — so they
 // match callRestUrl's behavior and a test/env change takes effect without a
-// module reload. The defaults live in _shared/backend.ts. The public GraphQL
-// endpoint is distinct from the flash auth backend (RUNPOD_GRAPHQL_URL, used
-// only by the OAuth flow in api/index.ts).
+// module reload. The defaults live in _shared/backend.ts. Three distinct
+// GraphQL hosts: publicGraphqlBase (credential-free), authedGraphqlBase (the
+// only one this module sends the caller's API key to), and RUNPOD_GRAPHQL_URL
+// (flash OAuth flow in api/index.ts only).
 
 // ============== CALLER TRACKING ==============
 // Adds structured caller identification to every outbound API call so the
@@ -162,6 +164,14 @@ export interface ToolRuntime {
   jsonReply: typeof jsonReply;
   // Public, no-auth GraphQL query against the Runpod GraphQL endpoint.
   graphql: <T>(query: string) => Promise<T>;
+  // Authenticated GraphQL operation (API-key Bearer) against the same endpoint,
+  // with variables support — the authenticated path accepts them (the public,
+  // unauthenticated path does not). Used for console-only operations that have
+  // no REST home yet (e.g. deploying a Hub release via saveEndpoint).
+  graphqlAuthed: <T>(
+    query: string,
+    variables?: Record<string, unknown>
+  ) => Promise<T>;
   // Authenticated v1 REST call, path-relative to the v1 base (e.g. `/endpoints`).
   runpodRequest: (
     endpoint: string,
@@ -206,15 +216,23 @@ async function graphqlRequest<T>(
   query: string,
   tracking: () => Record<string, string>,
   fetchImpl: HttpFetch,
-  url: string
+  url: string,
+  options?: {
+    variables?: Record<string, unknown>;
+    apiKey?: string;
+  }
 ): Promise<T> {
   const response = await fetchImpl(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      ...(options?.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
       ...tracking(),
     },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({
+      query,
+      ...(options?.variables ? { variables: options.variables } : {}),
+    }),
   });
 
   const result = (await response.json()) as {
@@ -354,6 +372,15 @@ export function createToolRuntime(
         tracking,
         httpFetch,
         publicGraphqlBase(process.env as Env)
+      ),
+    graphqlAuthed: <T>(query: string, variables?: Record<string, unknown>) =>
+      graphqlRequest<T>(
+        query,
+        tracking,
+        httpFetch,
+        // NOT publicGraphqlBase: this call carries the caller's API key.
+        authedGraphqlBase(process.env as Env),
+        { variables, apiKey: ctx.apiKey }
       ),
     runpodRequest,
     serverlessRequest,
