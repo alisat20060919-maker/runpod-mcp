@@ -1919,3 +1919,194 @@ describe('v1 catalog GraphQL uses the injected fetch (offline seam)', () => {
     assert.ok((parseText(out).items as unknown[]).length >= 1);
   });
 });
+
+// Hub listings are served by the same public GraphQL path as the v1 catalog,
+// on BOTH v1 and v2 (no REST home for the Hub yet). These pin the outbound
+// query shape, the client-side filters, and the compact mapped output.
+describe('list-hub-repos (public GraphQL Hub catalog)', () => {
+  const listings = [
+    {
+      id: 'lst_vllm',
+      repoId: '1',
+      title: 'vLLM',
+      description: 'OpenAI-compatible LLM endpoints',
+      repoName: 'worker-vllm',
+      repoOwner: 'runpod-workers',
+      createdAt: '2025-03-20T07:03:50.990Z',
+      updatedAt: '2026-07-28T15:34:28.240Z',
+      views: 1560,
+      stars: 460,
+      deploys: 41921,
+      language: 'Python',
+      category: 'language',
+      tags: ['llm', 'vllm'],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_vllm',
+        name: 'v2.22.5',
+        tagName: 'v2.22.5',
+        createdAt: '2026-06-26T18:48:13.000Z',
+        config: '{"runsOn":"GPU","containerDiskInGb":150}',
+        build: {
+          id: 'b1',
+          imageName: 'registry.runpod.net/worker-vllm:9e1c48313',
+        },
+      },
+    },
+    {
+      id: 'lst_comfy',
+      repoId: '2',
+      title: 'ComfyUI',
+      description: 'Generate images with ComfyUI',
+      repoName: 'worker-comfyui',
+      repoOwner: 'runpod-workers',
+      createdAt: '2025-03-12T15:26:43.567Z',
+      updatedAt: '2026-07-28T15:34:33.647Z',
+      views: 425,
+      stars: 721,
+      deploys: 13198,
+      language: 'Python',
+      category: 'image',
+      tags: ['comfyui', 'stable-diffusion'],
+      type: 'SERVERLESS',
+      listedRelease: {
+        id: 'rel_comfy',
+        name: '5.8.6',
+        tagName: '5.8.6',
+        createdAt: '2026-06-17T08:16:31.000Z',
+        config: '{"runsOn":"GPU","containerDiskInGb":20}',
+        build: {
+          id: 'b2',
+          imageName: 'registry.runpod.net/worker-comfyui:066a11c49',
+        },
+      },
+    },
+    {
+      id: 'lst_axolotl',
+      repoId: '3',
+      title: 'Axolotl Fine-Tuning',
+      description: 'Serverless fine-tuning of open-source LLMs',
+      repoName: 'axolotl',
+      repoOwner: 'axolotl-ai-cloud',
+      createdAt: '2025-05-01T00:00:00.000Z',
+      updatedAt: '2026-07-01T00:00:00.000Z',
+      views: 100,
+      stars: 9000,
+      deploys: 500,
+      language: 'Python',
+      category: 'language',
+      tags: ['fine-tuning', 'lora'],
+      type: 'SERVERLESS',
+      listedRelease: null,
+    },
+  ];
+
+  it('POSTs the listings query to the public GraphQL endpoint (works on v1 and v2, no auth path)', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: { data: { listings } },
+    });
+    const out = await handlers.get('list-hub-repos')!({});
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    assert.equal(outbound[0].method, 'POST');
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.match(body.query, /listings\(input: \{\}\)/);
+    assert.match(body.query, /listedRelease/);
+    // config is large — must NOT be requested unless includeConfig is set.
+    assert.doesNotMatch(body.query, /\bconfig\b/);
+    assert.equal((parseText(out).items as unknown[]).length, 3);
+  });
+
+  it('same GraphQL path under v2 (no REST home for the Hub)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBody: { data: { listings } },
+      });
+      await handlers.get('list-hub-repos')!({});
+      assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    });
+  });
+
+  it('maps to compact output: repo, urls, and the deploy-critical hubReleaseId + imageName; sorted most-deployed first', async () => {
+    const { handlers } = harness({ jsonBody: { data: { listings } } });
+    const out = await handlers.get('list-hub-repos')!({});
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      items.map((i) => i.repo),
+      [
+        'runpod-workers/worker-vllm',
+        'runpod-workers/worker-comfyui',
+        'axolotl-ai-cloud/axolotl',
+      ]
+    );
+    const vllm = items[0];
+    assert.equal(
+      vllm.hubUrl,
+      'https://console.runpod.io/hub/runpod-workers/worker-vllm'
+    );
+    assert.equal(
+      vllm.githubUrl,
+      'https://github.com/runpod-workers/worker-vllm'
+    );
+    const release = vllm.listedRelease as Record<string, unknown>;
+    assert.equal(release.hubReleaseId, 'rel_vllm');
+    assert.equal(
+      release.imageName,
+      'registry.runpod.net/worker-vllm:9e1c48313'
+    );
+    assert.equal('config' in release, false);
+    // A listing without a listed release maps to null, not a crash.
+    assert.equal(items[2].listedRelease, null);
+  });
+
+  it('filters client-side: searchTerm (title/tags), category, repoOwner, type', async () => {
+    const run = async (params: Record<string, unknown>) => {
+      const { handlers } = harness({ jsonBody: { data: { listings } } });
+      const out = await handlers.get('list-hub-repos')!(params);
+      return (parseText(out).items as Array<{ repo: string }>).map(
+        (i) => i.repo
+      );
+    };
+    assert.deepEqual(await run({ searchTerm: 'comfy' }), [
+      'runpod-workers/worker-comfyui',
+    ]);
+    assert.deepEqual(await run({ searchTerm: 'LoRA' }), [
+      'axolotl-ai-cloud/axolotl',
+    ]);
+    assert.deepEqual(await run({ category: 'image' }), [
+      'runpod-workers/worker-comfyui',
+    ]);
+    assert.deepEqual(await run({ repoOwner: 'axolotl-ai-cloud' }), [
+      'axolotl-ai-cloud/axolotl',
+    ]);
+    assert.deepEqual((await run({ type: 'SERVERLESS' })).length, 3);
+    assert.deepEqual(await run({ type: 'POD' }), []);
+  });
+
+  it('includeConfig:true requests config in the query and returns it parsed', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: { data: { listings } },
+    });
+    const out = await handlers.get('list-hub-repos')!({
+      includeConfig: true,
+      searchTerm: 'vllm',
+    });
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.match(body.query, /\bconfig\b/);
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    const release = items[0].listedRelease as Record<string, unknown>;
+    assert.deepEqual(release.config, { runsOn: 'GPU', containerDiskInGb: 150 });
+  });
+
+  it('caps results with the shared pagination envelope', async () => {
+    const { handlers } = harness({ jsonBody: { data: { listings } } });
+    const out = await handlers.get('list-hub-repos')!({ limit: 1 });
+    const payload = parseText(out);
+    assert.equal((payload.items as unknown[]).length, 1);
+    const pagination = payload.pagination as Record<string, unknown>;
+    assert.equal(pagination.total, 3);
+    assert.equal(pagination.truncated, true);
+    assert.ok(pagination.nextCursor);
+  });
+});

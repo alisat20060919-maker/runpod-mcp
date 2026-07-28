@@ -156,6 +156,8 @@ const ALLOWLIST_UNMAPPED_TOOLS: Record<string, string> = {
   'retry-job': 'serverless runtime API, not v2 REST',
   'endpoint-health': 'serverless runtime API, not v2 REST',
   'purge-endpoint-queue': 'serverless runtime API, not v2 REST',
+  'list-hub-repos':
+    'Hub catalog is served by the public GraphQL endpoint; no v2 REST home yet',
 };
 
 const specYaml = readFileSync(
