@@ -92,6 +92,13 @@ export function serverlessBase(env: Env): string {
 export function publicGraphqlBase(env: Env): string {
   return env.RUNPOD_PUBLIC_GRAPHQL_URL ?? 'https://api.runpod.io/graphql';
 }
+// A separate var from publicGraphqlBase despite the identical default:
+// RUNPOD_PUBLIC_GRAPHQL_URL is the documented credential-free discovery
+// override and gets pointed at stubs freely, so routing authed calls through it
+// would turn "point this anywhere" into "send the caller's API key there".
+export function authedGraphqlBase(env: Env): string {
+  return env.RUNPOD_AUTHED_GRAPHQL_URL ?? 'https://api.runpod.io/graphql';
+}
 
 // ---- A0: unwrap a list response into a plain array ----
 // v1 returns a bare array; v2 wraps it in a per-resource envelope. Either way

@@ -9,6 +9,7 @@ import {
   restV1Base,
   serverlessBase,
   publicGraphqlBase,
+  authedGraphqlBase,
   type Env,
   type Backend,
   type Resource,
@@ -25,9 +26,10 @@ import {
 // Base URLs are resolved LIVE per call (via restV1Base/serverlessBase/
 // publicGraphqlBase reading process.env), not frozen at module import — so they
 // match callRestUrl's behavior and a test/env change takes effect without a
-// module reload. The defaults live in _shared/backend.ts. The public GraphQL
-// endpoint is distinct from the flash auth backend (RUNPOD_GRAPHQL_URL, used
-// only by the OAuth flow in api/index.ts).
+// module reload. The defaults live in _shared/backend.ts. Three distinct
+// GraphQL hosts: publicGraphqlBase (credential-free), authedGraphqlBase (the
+// only one this module sends the caller's API key to), and RUNPOD_GRAPHQL_URL
+// (flash OAuth flow in api/index.ts only).
 
 // ============== CALLER TRACKING ==============
 // Adds structured caller identification to every outbound API call so the
@@ -376,7 +378,8 @@ export function createToolRuntime(
         query,
         tracking,
         httpFetch,
-        publicGraphqlBase(process.env as Env),
+        // NOT publicGraphqlBase: this call carries the caller's API key.
+        authedGraphqlBase(process.env as Env),
         { variables, apiKey: ctx.apiKey }
       ),
     runpodRequest,
