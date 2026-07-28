@@ -2669,6 +2669,25 @@ describe('set-endpoint-gpus (authenticated GraphQL GPU pinning)', () => {
     assert.equal((payload.endpoint as { id: string }).id, 'ep_pinme');
   });
 
+  it('minCudaVersion/allowedCudaVersions are overridable and otherwise echo the current values', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [queryBody, saveBody],
+    });
+    await handlers.get('set-endpoint-gpus')!({
+      endpointId: 'ep_pinme',
+      gpuIds: 'AMPERE_16',
+      minCudaVersion: '12.0',
+      allowedCudaVersions: '12.8,12.7,12.6,12.5,12.4',
+    });
+    const input = (
+      JSON.parse(outbound[1].body!) as {
+        variables: { input: Record<string, unknown> };
+      }
+    ).variables.input;
+    assert.equal(input.minCudaVersion, '12.0');
+    assert.equal(input.allowedCudaVersions, '12.8,12.7,12.6,12.5,12.4');
+  });
+
   it('builds the gpuIds string from pools + excludeGpuTypeIds; empty volume list echoes null; gpuCount overridable', async () => {
     const { handlers, outbound } = harness({
       jsonBodies: [queryBody, saveBody],

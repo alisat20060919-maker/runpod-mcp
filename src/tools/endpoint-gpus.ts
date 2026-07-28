@@ -93,6 +93,18 @@ export function registerEndpointGpuTools(
         .positive()
         .optional()
         .describe('GPUs per worker. Omit to keep the current value.'),
+      minCudaVersion: z
+        .string()
+        .optional()
+        .describe(
+          "Minimum host CUDA version workers may run on (e.g. '12.4'). Omit to keep the current value."
+        ),
+      allowedCudaVersions: z
+        .string()
+        .optional()
+        .describe(
+          "Comma-separated allowed host CUDA versions (e.g. '12.8,12.7,12.6'). Omit to keep the current value. CUDA compatibility is part of GPU selection — a narrow list can leave an endpoint unable to schedule workers."
+        ),
     },
     { title: 'Set endpoint GPUs', ...WRITE, idempotentHint: true },
     async (params) => {
@@ -181,8 +193,9 @@ export function registerEndpointGpuTools(
       // server-side type rejection for no gain.
       for (const [key, value] of Object.entries({
         templateId: current.templateId,
-        allowedCudaVersions: current.allowedCudaVersions,
-        minCudaVersion: current.minCudaVersion,
+        allowedCudaVersions:
+          params.allowedCudaVersions ?? current.allowedCudaVersions,
+        minCudaVersion: params.minCudaVersion ?? current.minCudaVersion,
         compliance: current.compliance,
         modelReferences: current.modelReferences,
       })) {
