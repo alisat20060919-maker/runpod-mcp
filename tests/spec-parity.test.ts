@@ -94,6 +94,7 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   updateEndpoint: ['update-endpoint'],
   deleteEndpoint: ['delete-endpoint'],
   listEndpointWorkers: ['list-endpoint-workers'],
+  listEndpointReleases: ['list-endpoint-releases'],
   getWorkerLogs: ['stream-worker-logs'],
   // templates
   listTemplates: ['list-templates'],
@@ -101,14 +102,6 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   getTemplate: ['get-template'],
   updateTemplate: ['update-template'],
   deleteTemplate: ['delete-template'],
-  // tags
-  listTags: ['list-tags'],
-  createTag: ['create-tag'],
-  getTag: ['get-tag'],
-  updateTag: ['update-tag'],
-  deleteTag: ['delete-tag'],
-  attachTagResource: ['attach-tag'],
-  detachTagResource: ['detach-tag'],
   // network volumes
   listNetworkVolumes: ['list-network-volumes'],
   createNetworkVolume: ['create-network-volume'],
@@ -120,6 +113,10 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   createRegistry: ['create-container-registry-auth'],
   getRegistry: ['get-container-registry-auth'],
   deleteRegistry: ['delete-container-registry-auth'],
+  // ECR delegations (scoped pull access instead of stored credentials)
+  listDelegations: ['list-registry-delegations'],
+  createDelegation: ['create-registry-delegation'],
+  revokeDelegation: ['delete-registry-delegation'],
   // catalog
   listGpuTypes: ['list-gpu-types'],
   getGpuType: ['get-gpu-type'],
@@ -136,13 +133,10 @@ const SPEC_OP_TO_TOOLS: Record<string, string[]> = {
   listClusterBilling: ['get-billing'],
 };
 
-// Spec operations we deliberately do NOT expose as a tool. Its tool is
-// implemented but registration is COMMENTED OUT (see src/tools/endpoints.ts
-// list-endpoint-releases). Remove the entry + uncomment the tool when it ships.
-const ALLOWLIST_UNMAPPED_OPS: Record<string, string> = {
-  listEndpointReleases:
-    'list-endpoint-releases implemented but disabled — dev-only op, prod 422s GET /v2/serverless/{id}/releases',
-};
+// Spec operations deliberately NOT exposed as a tool. Empty today — every operation
+// in the vendored spec maps to a registered tool. Add an entry (with the reason) if
+// an operation ships that we choose not to cover.
+const ALLOWLIST_UNMAPPED_OPS: Record<string, string> = {};
 
 // Registered tools that intentionally have NO v2 REST spec operation. The
 // serverless RUNTIME tools target a different service (api.runpod.ai/v2 — job
@@ -280,7 +274,7 @@ describe('live v2 shape (opt-in)', () => {
     { path: '/templates', key: 'templates' },
     { path: '/network-volumes', key: 'networkVolumes' },
     { path: '/registries', key: 'registries' },
-    { path: '/tags', key: 'tags' },
+    { path: '/registries/delegations', key: 'delegations' },
   ];
 
   for (const check of CHECKS) {
