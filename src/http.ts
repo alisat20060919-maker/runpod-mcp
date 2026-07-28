@@ -1,6 +1,10 @@
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
 import { registerTools } from './tools.js';
+import {
+  createCredentialChecker,
+  type CredentialChecker,
+} from './_shared/credential-check.js';
 import { IncomingMessage, ServerResponse } from 'node:http';
 
 /**
@@ -46,6 +50,15 @@ function writeUnauthorized(
   res.end(JSON.stringify({ error }));
 }
 
+// Default pre-flight credential checker, shared across requests so its
+// verdict cache actually helps on a warm instance. Verifies against the same
+// auth backend the OAuth flow uses (RUNPOD_GRAPHQL_URL). Uses the global
+// fetch (Node >= 18) — the check runs before any MCP/tool wiring exists.
+const defaultCredentialChecker: CredentialChecker = createCredentialChecker({
+  fetch: (url, init) => fetch(url, init),
+  url: () => process.env.RUNPOD_GRAPHQL_URL || 'https://api.runpod.io/graphql',
+});
+
 /**
  * Handle an incoming HTTP request as a streamable MCP session.
  *
@@ -54,11 +67,22 @@ function writeUnauthorized(
  * Runpod API key (set manually by the caller) or a token obtained through the
  * OAuth "Sign in with Runpod" flow. The server holds no credential of its own
  * and never shares one across users.
+ *
+ * The token is pre-flight verified (cached) before the MCP request is
+ * handled: a dead credential — e.g. an OAuth-minted key that expired or was
+ * revoked mid-session — must surface as an HTTP 401 + WWW-Authenticate so
+ * OAuth-capable clients re-run their auth flow automatically. Without this,
+ * the upstream 401 is wrapped into a 200 JSON-RPC tool error and the client
+ * never re-authenticates. Set MCP_SKIP_CREDENTIAL_CHECK=true to disable.
  */
 export async function handleMcpRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  opts: { serverVersion?: string } = {}
+  opts: {
+    serverVersion?: string;
+    // Test seam — production uses the shared default checker.
+    verifyCredential?: CredentialChecker;
+  } = {}
 ): Promise<void> {
   const bearerToken = extractBearerToken(req);
   console.log('mcp_request', {
@@ -73,6 +97,21 @@ export async function handleMcpRequest(
       'Missing or invalid Authorization header. Provide a Bearer token.'
     );
     return;
+  }
+
+  if (process.env.MCP_SKIP_CREDENTIAL_CHECK !== 'true') {
+    const verify = opts.verifyCredential ?? defaultCredentialChecker;
+    const verdict = await verify(bearerToken);
+    if (!verdict.valid) {
+      writeUnauthorized(
+        req,
+        res,
+        `${
+          verdict.reason ?? 'The Runpod API rejected the credential.'
+        } Re-authenticate to continue.`
+      );
+      return;
+    }
   }
 
   const server = createServer(opts.serverVersion);

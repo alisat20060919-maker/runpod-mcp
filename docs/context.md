@@ -38,6 +38,7 @@ All optional, with production-safe defaults:
 - `RUNPOD_AUTHED_GRAPHQL_URL`: override the GraphQL host for authenticated, no-REST-equivalent operations (`deploy-hub-repo`, `set-endpoint-gpus`). Sends the caller's API key — point it only at a trusted host.
 - `RUNPOD_API_KEY_NAME`: name for the minted key (default `runpod-mcp`; `""` to omit).
 - `MCP_VERBOSE_LOGS`: `true` to log OAuth request ids (live auth codes) for debugging.
+- `MCP_SKIP_CREDENTIAL_CHECK`: set to `true` to disable the hosted pre-flight credential verification (dead bearers then surface as tool-level 401 errors instead of an HTTP 401 re-auth signal).
 
 The npm package exports:
 

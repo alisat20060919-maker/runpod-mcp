@@ -38,7 +38,15 @@ export class HttpError extends Error {
   readonly status: number;
   readonly body: string;
   constructor(prefix: string, status: number, body: string) {
-    super(`${prefix}: ${status} - ${body}`);
+    // A 401 means the credential itself is dead (expired/revoked key), not
+    // that the request was wrong. Say so — a bare "401 - Unauthorized" gives
+    // an agent nothing actionable, and on stdio (env-var API key) there is no
+    // HTTP layer to convert this into a re-auth signal.
+    const hint =
+      status === 401
+        ? ' (the Runpod API rejected the credential — the API key may be expired or revoked; re-authenticate or update RUNPOD_API_KEY)'
+        : '';
+    super(`${prefix}: ${status} - ${body}${hint}`);
     this.name = 'HttpError';
     this.status = status;
     this.body = body;

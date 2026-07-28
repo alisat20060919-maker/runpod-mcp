@@ -43,6 +43,7 @@ The hosted HTTP path (`api/index.ts` + `src/http.ts`) reads these, all optional 
 - `RUNPOD_AUTHED_GRAPHQL_URL`: override the GraphQL host for **authenticated** operations with no REST equivalent — `deploy-hub-repo` and `set-endpoint-gpus` (default `https://api.runpod.io/graphql`). These send the caller's API key as a Bearer token, so only point this at a host you trust with it; on the hosted server that key is a per-user OAuth-minted one.
 - `RUNPOD_API_KEY_NAME`: name for the minted key (default `runpod-mcp`; set to `""` to omit for a backend without the `apiKeyName` argument).
 - `MCP_VERBOSE_LOGS`: set to `true` to log OAuth request ids (live auth codes) for debugging.
+- `MCP_SKIP_CREDENTIAL_CHECK`: set to `true` to disable the hosted pre-flight credential verification (dead bearers then surface as tool-level 401 errors instead of an HTTP 401 re-auth signal).
 
 The build produces `dist/stdio.*`, `dist/http.*`, and `dist/tools.*`. Because `package.json` has `"type": "module"`, always use `dist/stdio.mjs` when running the built local server with `node`.
 
