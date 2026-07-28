@@ -123,6 +123,19 @@ function listingsQuery(withConfig: boolean): string {
   `;
 }
 
+// Serializes a boolean through the schema's trueValue/falseValue. Applied to
+// caller values too: an agent naturally passes 'true' where the schema declares
+// trueValue '1', so the worker would get a value its own schema calls invalid.
+// Only exact 'true'/'false' map; anything else is a deliberate literal.
+function serializeBoolean(
+  value: string,
+  input: { type?: string; trueValue?: string; falseValue?: string }
+): string {
+  if (value === 'true') return input.trueValue ?? 'true';
+  if (value === 'false') return input.falseValue ?? 'false';
+  return value;
+}
+
 // Builds the template env array a Hub deploy submits: every key from the
 // release's env schema with its default (booleans serialized through
 // trueValue/falseValue), overridden by caller-provided values. Caller keys not
@@ -141,22 +154,46 @@ export function buildHubEnv(
 
   for (const entry of config.env ?? []) {
     const input = entry.input ?? {};
-    let value: string;
-    if (entry.key in remaining) {
-      value = remaining[entry.key];
-      delete remaining[entry.key];
-    } else if (input.default !== undefined && input.default !== null) {
-      value =
-        typeof input.default === 'boolean'
-          ? input.default
-            ? (input.trueValue ?? 'true')
-            : (input.falseValue ?? 'false')
-          : String(input.default);
-    } else {
-      if (input.required) missingRequired.push(entry.key);
-      value = '';
+    const override = entry.key in remaining ? remaining[entry.key] : undefined;
+    delete remaining[entry.key];
+
+    // An override present but EMPTY is not a value. Checking `key in remaining`
+    // alone let `env: { MODEL_NAME: '' }` satisfy a required key, so fail-fast
+    // passed and the deploy produced a broken worker.
+    if (override !== undefined && override !== '') {
+      env.push({
+        key: entry.key,
+        value:
+          input.type === 'boolean'
+            ? serializeBoolean(override, input)
+            : override,
+      });
+      continue;
     }
-    env.push({ key: entry.key, value });
+
+    if (input.default !== undefined && input.default !== null) {
+      env.push({
+        key: entry.key,
+        value:
+          typeof input.default === 'boolean'
+            ? input.default
+              ? (input.trueValue ?? 'true')
+              : (input.falseValue ?? 'false')
+            : String(input.default),
+      });
+      continue;
+    }
+
+    if (input.required) {
+      missingRequired.push(entry.key);
+      // Still submitted so the key is visible on the endpoint, though the tool
+      // aborts on a non-empty missingRequired before the caller sees it.
+      env.push({ key: entry.key, value: '' });
+      continue;
+    }
+
+    // Optional, no default, nothing supplied: OMIT the key rather than send ''.
+    // os.environ.get('X', 'fb') returns '' when X='', shadowing the fallback.
   }
 
   for (const [key, value] of Object.entries(remaining)) {
@@ -263,9 +300,13 @@ export function registerHubTools(server: McpServer, rt: ToolRuntime): void {
         );
       }
 
-      // Most-deployed first so the well-known workers surface at the top.
+      // Most-deployed first so well-known workers surface at the top, id as
+      // tiebreak. The tiebreak is load-bearing: each page re-fetches the whole
+      // catalog and `listings(input: {})` promises no order, so ties move
+      // between requests and paging silently skips and duplicates.
       listings = [...listings].sort(
-        (a, b) => (b.deploys ?? 0) - (a.deploys ?? 0)
+        (a, b) =>
+          (b.deploys ?? 0) - (a.deploys ?? 0) || a.id.localeCompare(b.id)
       );
 
       const result = listings.map((l) => ({
