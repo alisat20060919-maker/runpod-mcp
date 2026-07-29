@@ -345,3 +345,77 @@ describe('tracking headers', () => {
     );
   });
 });
+
+// ============== 429 rate-limit hint ==============
+// A bare "429 - rate limit exceeded" invites an immediate retry — the worst
+// response. The hint parses the API's RateLimit header so the error says which
+// window is exhausted and when it resets. (Observed live: a bulk GC burned the
+// hourly quota and every delete bounced with no guidance.)
+import { rateLimitHint } from '../src/_shared/http.js';
+
+describe('429 rate-limit hint', () => {
+  const HEADER = '"minute";r=12;t=44, "hour";r=0;t=1724, "day";r=31839;t=23324';
+
+  it('rateLimitHint names the exhausted window and its reset time', () => {
+    assert.equal(
+      rateLimitHint(HEADER),
+      'rate limited — the hour quota is exhausted; it resets in ~1724s. Wait before retrying and pace bulk operations'
+    );
+  });
+
+  it('rateLimitHint falls back to generic guidance without a header or without an exhausted window', () => {
+    assert.match(rateLimitHint(null), /back off and pace bulk operations/);
+    assert.match(
+      rateLimitHint('"minute";r=5;t=10'),
+      /back off and pace bulk operations/
+    );
+  });
+
+  it('a 429 response carries the parsed hint on the error message', async () => {
+    const resp = {
+      ok: false,
+      status: 429,
+      headers: {
+        get: (n: string) => (n.toLowerCase() === 'ratelimit' ? HEADER : null),
+      },
+      json: async () => ({}),
+      text: async () => '{"detail":"rate limit exceeded for the hour window"}',
+    };
+    const client = createHttpClient({
+      apiKey: 'k',
+      fetch: async () => resp,
+      tracking: noTracking,
+      errorPrefix: 'Runpod API Error',
+    });
+    await assert.rejects(
+      () => client('http://x'),
+      (err: unknown) => {
+        assert.ok(err instanceof HttpError);
+        assert.equal(err.status, 429);
+        assert.match(err.message, /hour quota is exhausted/);
+        assert.match(err.message, /resets in ~1724s/);
+        // status/body stay clean for programmatic callers.
+        assert.equal(
+          err.body,
+          '{"detail":"rate limit exceeded for the hour window"}'
+        );
+        return true;
+      }
+    );
+  });
+
+  it('non-429 errors carry no rate-limit hint', async () => {
+    const client = createHttpClient({
+      apiKey: 'k',
+      fetch: fakeFetch(
+        fakeResponse({ status: 500, ok: false, textBody: 'boom' })
+      ),
+      tracking: noTracking,
+      errorPrefix: 'Runpod API Error',
+    });
+    await assert.rejects(
+      () => client('http://x'),
+      /Runpod API Error: 500 - boom$/
+    );
+  });
+});
