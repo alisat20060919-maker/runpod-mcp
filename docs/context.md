@@ -31,14 +31,14 @@ The codebase now has two transport entrypoints and one shared tool registry:
 
 All optional, with production-safe defaults:
 
-- `RUNPOD_GRAPHQL_URL`: flash auth backend for the OAuth flow (default `https://api.runpod.io/graphql`).
+- `RUNPOD_GRAPHQL_URL`: flash auth backend for the OAuth flow (default `https://api.runpod.io/graphql`). Also the host the hosted credential pre-flight verifies against, so unlike the guest flash-auth mutations it now receives the caller's bearer token — point it only at a host you trust with that.
 - `CONSOLE_BASE_URL`: console hosting the sign-in handoff page (default `https://console.runpod.io`).
 - `RUNPOD_REST_API_URL` / `RUNPOD_SERVERLESS_API_URL`: override the REST and Serverless API hosts.
 - `RUNPOD_PUBLIC_GRAPHQL_URL`: override the public discovery GraphQL host used by `list-gpu-types`/`list-data-centers`. Never carries a credential.
 - `RUNPOD_AUTHED_GRAPHQL_URL`: override the GraphQL host for authenticated, no-REST-equivalent operations (`deploy-hub-repo`, `set-endpoint-gpus`). Sends the caller's API key — point it only at a trusted host.
 - `RUNPOD_API_KEY_NAME`: name for the minted key (default `runpod-mcp`; `""` to omit).
 - `MCP_VERBOSE_LOGS`: `true` to log OAuth request ids (live auth codes) for debugging.
-- `MCP_SKIP_CREDENTIAL_CHECK`: set to `true` to disable the hosted pre-flight credential verification (dead bearers then surface as tool-level 401 errors instead of an HTTP 401 re-auth signal).
+- `MCP_SKIP_CREDENTIAL_CHECK`: set to the exact string `true` to disable the hosted pre-flight credential verification (dead bearers then surface as tool-level 401 errors instead of an HTTP 401 re-auth signal). Use this if the pre-flight itself is ever causing outages. Note the pre-flight ALSO self-disables when a REST/Serverless host is overridden without a matching `RUNPOD_GRAPHQL_URL`, since it would otherwise validate the key against the wrong environment and reject every request.
 
 The npm package exports:
 

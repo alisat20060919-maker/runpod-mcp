@@ -49,6 +49,11 @@ function harness(opts?: {
     url: string,
     o: { maxWaitMs: number; maxBytes: number }
   ) => Promise<{ raw: string; truncated: boolean }>;
+  // Observer for the ToolContext 401 hook (hosted credential invalidation).
+  onUnauthorized?: () => void;
+  // Transport under the SSE reader, so a test can drive an SSE 401 through the
+  // observer (injecting `streamSse` replaces the reader and bypasses it).
+  sseStatus?: number;
 }) {
   const handlers = new Map<string, Handler>();
   const outbound: OutboundRecord[] = [];
@@ -95,10 +100,28 @@ function harness(opts?: {
     };
   };
 
-  registerTools(fakeServer, { apiKey: 'rpa_test', transport: 'stdio' }, {
-    fetch: fakeFetch as Parameters<typeof registerTools>[2]['fetch'],
-    ...(opts?.streamSse ? { streamSse: opts.streamSse } : {}),
-  } as Parameters<typeof registerTools>[2]);
+  registerTools(
+    fakeServer,
+    {
+      apiKey: 'rpa_test',
+      transport: 'stdio',
+      ...(opts?.onUnauthorized ? { onUnauthorized: opts.onUnauthorized } : {}),
+    },
+    {
+      fetch: fakeFetch as Parameters<typeof registerTools>[2]['fetch'],
+      ...(opts?.streamSse ? { streamSse: opts.streamSse } : {}),
+      ...(opts?.sseStatus
+        ? {
+            sseFetch: async () => ({
+              ok: opts.sseStatus! >= 200 && opts.sseStatus! < 300,
+              status: opts.sseStatus!,
+              text: async () => 'denied',
+              body: null,
+            }),
+          }
+        : {}),
+    } as Parameters<typeof registerTools>[2]
+  );
 
   return { handlers, outbound };
 }
@@ -2774,5 +2797,97 @@ describe('v2 additions surfaced by the spec resync', () => {
       assert.equal((reply.items as unknown[]).length, 2);
       assert.equal(reply.endpointVersion, 12);
     });
+  });
+});
+
+// ============== 401 observer (hosted credential invalidation) ==============
+// The hosted server caches a "credential is valid" verdict. A tool call that
+// 401s proves that verdict wrong before its TTL expires, so the runtime reports
+// it through ToolContext.onUnauthorized and the next request re-checks — that is
+// what lets the server answer 401 + WWW-Authenticate instead of serving another
+// wrapped-200 error for the rest of the TTL.
+describe('ToolContext.onUnauthorized (401 observer)', () => {
+  it('fires when an outbound call answers 401', async () => {
+    let fired = 0;
+    const { handlers } = harness({
+      status: 401,
+      jsonBody: { error: 'Unauthorized' },
+      onUnauthorized: () => fired++,
+    });
+    await assert.rejects(() => handlers.get('list-pods')!({}));
+    assert.equal(fired, 1, 'onUnauthorized was not called for a 401');
+  });
+
+  it('does not fire on success, or on a non-401 failure', async () => {
+    let fired = 0;
+    const ok = harness({ jsonBody: [], onUnauthorized: () => fired++ });
+    await ok.handlers.get('list-pods')!({});
+    assert.equal(fired, 0, 'fired on a 200');
+
+    const forbidden = harness({
+      status: 403,
+      jsonBody: { error: 'Forbidden' },
+      onUnauthorized: () => fired++,
+    });
+    await assert.rejects(() => forbidden.handlers.get('list-pods')!({}));
+    assert.equal(fired, 0, 'fired on a 403 — only 401 means a dead credential');
+  });
+
+  it('is optional — the stdio path registers no observer and still works', async () => {
+    const { handlers, outbound } = harness({ jsonBody: [] });
+    await handlers.get('list-pods')!({});
+    assert.equal(outbound.length, 1);
+  });
+});
+
+// The SSE reader binds its own transport, so it does NOT go through the JSON
+// clients' fetch. It must still report a 401, or a credential that dies during
+// stream-pod-logs / stream-worker-logs is never noticed by the hosted server.
+describe('ToolContext.onUnauthorized — SSE tools', () => {
+  it('fires when the SSE stream itself answers 401', async () => {
+    await withV2(async () => {
+      let fired = 0;
+      const { handlers } = harness({
+        sseStatus: 401,
+        onUnauthorized: () => fired++,
+      });
+      // The tool surfaces the failure in its reply rather than throwing; what
+      // matters here is that the 401 reached the observer either way.
+      await handlers.get('stream-pod-logs')!({ podId: 'p' }).catch(() => {});
+      assert.equal(fired, 1, 'an SSE 401 bypassed the observer');
+    });
+  });
+
+  it('does not fire when the SSE stream answers a non-401 failure', async () => {
+    await withV2(async () => {
+      let fired = 0;
+      const { handlers } = harness({
+        sseStatus: 403,
+        onUnauthorized: () => fired++,
+      });
+      await handlers.get('stream-pod-logs')!({ podId: 'p' }).catch(() => {});
+      assert.equal(fired, 0, 'only a 401 means a dead credential');
+    });
+  });
+});
+
+// The public GraphQL catalog query sends no Authorization header, so a 401 from
+// that host says nothing about the caller's credential. Observing it would drop a
+// good cached verdict and push every caller back through the pre-flight — and
+// under an egress-IP block, every catalog call would do it.
+describe('onUnauthorized ignores the unauthenticated GraphQL path', () => {
+  it('does not fire when the public catalog query 401s', async () => {
+    let fired = 0;
+    const { handlers, outbound } = harness({
+      status: 401,
+      jsonBody: { errors: [{ message: 'blocked' }] },
+      onUnauthorized: () => fired++,
+    });
+    await handlers.get('list-gpu-types')!({}).catch(() => {});
+    assert.ok(
+      outbound.some((c) => c.url.includes('graphql')),
+      'expected the public GraphQL call'
+    );
+    assert.equal(fired, 0, 'a no-credential 401 invalidated the verdict');
   });
 });

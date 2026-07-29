@@ -1,5 +1,0 @@
----
-'@runpod/mcp-server': patch
----
-
-Surface dead credentials as a proper HTTP 401 + `WWW-Authenticate` on the hosted server so OAuth-capable MCP clients re-authenticate automatically. Previously, when the OAuth-minted API key expired or was revoked mid-session, every upstream Runpod API call failed with a 401 that the MCP SDK wrapped into a 200 JSON-RPC tool error — the client never saw an HTTP 401, never re-ran its auth flow, and the user was stuck with bare "Unauthorized" tool errors until they manually reconnected. The hosted request handler now pre-flight verifies the bearer (one cached `myself` GraphQL query; valid verdicts cached ~5 minutes, invalid ~30 seconds, keyed by token hash) and responds 401 with the protected-resource metadata when the credential is dead. Verification fails open on auth-backend errors so a blip cannot take the server down; set `MCP_SKIP_CREDENTIAL_CHECK=true` to disable the pre-flight entirely. Upstream 401s that still reach a tool (stdio env-key users, cache windows) now carry an actionable hint instead of a bare "401 - Unauthorized".

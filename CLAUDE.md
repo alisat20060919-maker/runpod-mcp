@@ -36,14 +36,14 @@ The source is split by responsibility:
 
 The hosted HTTP path (`api/index.ts` + `src/http.ts`) reads these, all optional with production-safe defaults:
 
-- `RUNPOD_GRAPHQL_URL`: flash auth backend for the OAuth flow (default `https://api.runpod.io/graphql`).
+- `RUNPOD_GRAPHQL_URL`: flash auth backend for the OAuth flow (default `https://api.runpod.io/graphql`). Also the host the hosted credential pre-flight verifies against, so unlike the guest flash-auth mutations it now receives the caller's bearer token — point it only at a host you trust with that.
 - `CONSOLE_BASE_URL`: console that hosts the sign-in handoff page (default `https://console.runpod.io`).
 - `RUNPOD_REST_API_URL` / `RUNPOD_SERVERLESS_API_URL`: override the REST and Serverless API hosts (e.g. for a dev API key).
 - `RUNPOD_PUBLIC_GRAPHQL_URL`: override the public discovery GraphQL host used by `list-gpu-types`/`list-data-centers` (default `https://api.runpod.io/graphql`). Never carries a credential — safe to point at a stub.
 - `RUNPOD_AUTHED_GRAPHQL_URL`: override the GraphQL host for **authenticated** operations with no REST equivalent — `deploy-hub-repo` and `set-endpoint-gpus` (default `https://api.runpod.io/graphql`). These send the caller's API key as a Bearer token, so only point this at a host you trust with it; on the hosted server that key is a per-user OAuth-minted one.
 - `RUNPOD_API_KEY_NAME`: name for the minted key (default `runpod-mcp`; set to `""` to omit for a backend without the `apiKeyName` argument).
 - `MCP_VERBOSE_LOGS`: set to `true` to log OAuth request ids (live auth codes) for debugging.
-- `MCP_SKIP_CREDENTIAL_CHECK`: set to `true` to disable the hosted pre-flight credential verification (dead bearers then surface as tool-level 401 errors instead of an HTTP 401 re-auth signal).
+- `MCP_SKIP_CREDENTIAL_CHECK`: set to the exact string `true` to disable the hosted pre-flight credential verification (dead bearers then surface as tool-level 401 errors instead of an HTTP 401 re-auth signal). Use this if the pre-flight itself is ever causing outages. Note the pre-flight ALSO self-disables when a REST/Serverless host is overridden without a matching `RUNPOD_GRAPHQL_URL`, since it would otherwise validate the key against the wrong environment and reject every request.
 
 The build produces `dist/stdio.*`, `dist/http.*`, and `dist/tools.*`. Because `package.json` has `"type": "module"`, always use `dist/stdio.mjs` when running the built local server with `node`.
 

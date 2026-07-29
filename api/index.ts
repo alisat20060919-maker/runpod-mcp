@@ -498,9 +498,13 @@ export default async function handler(
   }
 
   res.setHeader('Access-Control-Allow-Origin', '*');
+  // WWW-Authenticate MUST be exposed: it is how a 401 tells an OAuth-capable
+  // client to re-run its auth flow, and browsers hide every non-safelisted
+  // response header from JavaScript unless it is listed here. Omitting it makes
+  // the re-auth signal invisible to browser-based MCP clients.
   res.setHeader(
     'Access-Control-Expose-Headers',
-    'Mcp-Session-Id, Content-Type'
+    'Mcp-Session-Id, Content-Type, WWW-Authenticate'
   );
 
   const pathname = new URL(req.url ?? '/', getBaseUrl(req)).pathname;
