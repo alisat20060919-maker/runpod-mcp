@@ -59,6 +59,11 @@ export interface ToolContext {
   transport: 'stdio' | 'http';
   clientUserAgent?: string;
   serverVersion?: string;
+  // Called when an outbound call answers 401, i.e. the credential just died.
+  // The hosted server uses it to drop the cached pre-flight verdict so the very
+  // next request re-checks and can emit the 401 + WWW-Authenticate that makes a
+  // client re-authenticate, instead of waiting out the cache TTL.
+  onUnauthorized?: () => void;
 }
 
 /**
@@ -140,6 +145,10 @@ export interface ToolDeps {
   // Test seam for the SSE log stream (stream-pod-logs). Production builds a
   // node-fetch reader; tests inject a fake returning canned event-stream text.
   streamSse?: StreamSse;
+  // Lower-level seam: the fetch the SSE reader uses. `streamSse` replaces the
+  // whole reader (and so bypasses the 401 observer); this replaces only its
+  // transport, which is what lets a test drive an SSE 401 through the observer.
+  sseFetch?: SseFetch;
 }
 
 // A bounded Server-Sent-Events read. Returns the raw accumulated stream text
@@ -264,7 +273,31 @@ export function createToolRuntime(
   deps: ToolDeps = {}
 ): ToolRuntime {
   const tracking = () => trackingHeaders(server, ctx);
-  const httpFetch = deps.fetch ?? defaultFetch;
+
+  // Report a 401 once, at the transport boundary, instead of at each of the ~30
+  // call sites. Applied to BOTH outbound fetch seams: the JSON clients (REST
+  // v1/v2, serverless, GraphQL) and the SSE reader, which binds its own fetch
+  // and would otherwise let stream-pod-logs / stream-worker-logs 401s go
+  // unreported. Pass-through when no observer is registered (stdio).
+  function observeUnauthorized<
+    A extends unknown[],
+    R extends { status: number },
+  >(fn: (...args: A) => Promise<R>): (...args: A) => Promise<R> {
+    const notify = ctx.onUnauthorized;
+    if (!notify) return fn;
+    return async (...args: A) => {
+      const response = await fn(...args);
+      if (response.status === 401) notify();
+      return response;
+    };
+  }
+
+  // Only the AUTHENTICATED seams are observed. The public GraphQL query sends no
+  // Authorization header at all, so a 401 from that host (a WAF block, say) says
+  // nothing about the caller's credential — observing it would drop a good verdict
+  // and force every caller back through the pre-flight.
+  const rawFetch = deps.fetch ?? defaultFetch;
+  const httpFetch = observeUnauthorized(rawFetch);
 
   // v1 REST client (path-relative to the v1 base).
   const v1Client = createHttpClient({
@@ -326,11 +359,14 @@ export function createToolRuntime(
   // logs.ts (readSseSnapshot) so it is unit-testable against a mock Response; here
   // we just bind it to node-fetch + the authenticated headers. Overridable via
   // deps for offline handler tests.
+  const sseFetch = observeUnauthorized(
+    deps.sseFetch ?? (fetch as unknown as SseFetch)
+  );
   const streamSse: StreamSse =
     deps.streamSse ??
     ((url, opts) =>
       readSseSnapshot(
-        fetch as unknown as SseFetch,
+        sseFetch,
         url,
         {
           Authorization: `Bearer ${ctx.apiKey}`,
@@ -370,7 +406,8 @@ export function createToolRuntime(
       graphqlRequest<T>(
         query,
         tracking,
-        httpFetch,
+        // rawFetch, not httpFetch: this call carries no credential (see above).
+        rawFetch,
         publicGraphqlBase(process.env as Env)
       ),
     graphqlAuthed: <T>(query: string, variables?: Record<string, unknown>) =>

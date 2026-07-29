@@ -20,6 +20,7 @@ beforeEach(() => {
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerTools } from '../src/tools.js';
+import { clearQueuedJobDiagnosisCache } from '../src/tools/jobs.js';
 
 // ============== Handler integration / outbound-request golden ==============
 // Drives the REAL registerTools against a fake McpServer (captures handlers) and
@@ -43,12 +44,22 @@ function harness(opts?: {
   jsonBodies?: unknown[];
   status?: number;
   contentType?: string;
+  // Per-call responses, consumed one per outbound request (falls back to the
+  // single-response options once exhausted). For handlers that make more than one
+  // call with DIFFERENT statuses — e.g. update-endpoint's scaler lookup followed
+  // by the PATCH.
+  steps?: Array<{ status?: number; jsonBody?: unknown; text?: string }>;
   // Fake SSE reader for stream-pod-logs (the real one uses node-fetch directly,
   // bypassing the injected fetch). Records its calls and returns canned text.
   streamSse?: (
     url: string,
     o: { maxWaitMs: number; maxBytes: number }
   ) => Promise<{ raw: string; truncated: boolean }>;
+  // Observer for the ToolContext 401 hook (hosted credential invalidation).
+  onUnauthorized?: () => void;
+  // Transport under the SSE reader, so a test can drive an SSE 401 through the
+  // observer (injecting `streamSse` replaces the reader and bypasses it).
+  sseStatus?: number;
 }) {
   const handlers = new Map<string, Handler>();
   const outbound: OutboundRecord[] = [];
@@ -66,8 +77,8 @@ function harness(opts?: {
     },
   } as unknown as McpServer;
 
-  const status = opts?.status ?? 200;
   const queue = opts?.jsonBodies ? [...opts.jsonBodies] : null;
+  const steps = opts?.steps ? [...opts.steps] : null;
   const fakeFetch = async (
     url: string,
     init: { method: string; headers: Record<string, string>; body?: string }
@@ -78,9 +89,13 @@ function harness(opts?: {
       body: init.body,
       headers: init.headers,
     });
-    const jsonBody = queue
-      ? (queue.shift() ?? opts?.jsonBody ?? [])
-      : (opts?.jsonBody ?? []);
+    const step = steps?.shift();
+    const status = step?.status ?? opts?.status ?? 200;
+    const jsonBody = step
+      ? (step.jsonBody ?? {})
+      : queue
+        ? (queue.shift() ?? opts?.jsonBody ?? [])
+        : (opts?.jsonBody ?? []);
     return {
       ok: status >= 200 && status < 300,
       status,
@@ -91,14 +106,32 @@ function harness(opts?: {
             : null,
       },
       json: async () => jsonBody,
-      text: async () => '',
+      text: async () => step?.text ?? '',
     };
   };
 
-  registerTools(fakeServer, { apiKey: 'rpa_test', transport: 'stdio' }, {
-    fetch: fakeFetch as Parameters<typeof registerTools>[2]['fetch'],
-    ...(opts?.streamSse ? { streamSse: opts.streamSse } : {}),
-  } as Parameters<typeof registerTools>[2]);
+  registerTools(
+    fakeServer,
+    {
+      apiKey: 'rpa_test',
+      transport: 'stdio',
+      ...(opts?.onUnauthorized ? { onUnauthorized: opts.onUnauthorized } : {}),
+    },
+    {
+      fetch: fakeFetch as Parameters<typeof registerTools>[2]['fetch'],
+      ...(opts?.streamSse ? { streamSse: opts.streamSse } : {}),
+      ...(opts?.sseStatus
+        ? {
+            sseFetch: async () => ({
+              ok: opts.sseStatus! >= 200 && opts.sseStatus! < 300,
+              status: opts.sseStatus!,
+              text: async () => 'denied',
+              body: null,
+            }),
+          }
+        : {}),
+    } as Parameters<typeof registerTools>[2]
+  );
 
   return { handlers, outbound };
 }
@@ -1616,12 +1649,11 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       assert.equal(body.image, 'img:2');
       assert.equal('imageName' in body, false);
       assert.deepEqual(body.gpu, { pools: ['AMPERE_80'], count: 1 });
-      assert.deepEqual(body.workers, { min: 0, max: 3 });
-      assert.deepEqual(body.scaling, {
-        type: 'QUEUE_DELAY',
-        value: 4,
-        idleTimeout: 5,
-      });
+      // Typed schema: routing `type` at the top level, idleTimeout under
+      // `workers`, and the scaler target under a per-variant key.
+      assert.equal(body.type, 'QUEUE');
+      assert.deepEqual(body.workers, { min: 0, max: 3, idleTimeout: 5 });
+      assert.deepEqual(body.scaling, { type: 'QUEUE_DELAY', queueDelay: 4 });
       assert.equal(body.disk, 20);
       assert.deepEqual(body.env, { K: 'V' });
       assert.deepEqual(body.networkVolumes, ['nv_1']);
@@ -1669,6 +1701,177 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       assert.equal(outbound.length, 0);
       assert.equal(parseText(out).status, 400);
       assert.match(parseText(out).error as string, /gpuPoolIds/);
+    });
+  });
+
+  it('create-endpoint v2 rejects LOAD_BALANCER + QUEUE_DELAY before any request', async () => {
+    // A load balancer has no queue to measure, so the combination can never be
+    // valid — caught client-side rather than spending a round trip on a 422.
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = await handlers.get('create-endpoint')!({
+        name: 'e',
+        imageName: 'img:2',
+        gpuPoolIds: ['AMPERE_80'],
+        endpointType: 'LOAD_BALANCER',
+        scalerType: 'QUEUE_DELAY',
+      });
+      assert.equal(outbound.length, 0);
+      assert.equal(parseText(out).status, 400);
+      assert.match(parseText(out).error as string, /no request queue/);
+    });
+  });
+
+  it('create-endpoint v2 rejects a fractional scalerValue under REQUEST_COUNT', async () => {
+    // REQUEST_COUNT counts whole in-flight requests. The schema can only floor
+    // scalerValue at 0.5 (the QUEUE_DELAY minimum), so the integer half is
+    // checked here, against the scaler actually being sent.
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = await handlers.get('create-endpoint')!({
+        name: 'e',
+        imageName: 'img:2',
+        gpuPoolIds: ['AMPERE_80'],
+        scalerType: 'REQUEST_COUNT',
+        scalerValue: 2.5,
+      });
+      assert.equal(outbound.length, 0);
+      assert.equal(parseText(out).status, 400);
+      assert.match(parseText(out).error as string, /integer >= 1/);
+    });
+  });
+
+  it('create-endpoint v2 applies the integer bound to a LOAD_BALANCER default scaler', async () => {
+    // No scalerType passed: LOAD_BALANCER defaults to REQUEST_COUNT, so the
+    // bound has to be judged on the resolved scaler, not the named one.
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = await handlers.get('create-endpoint')!({
+        name: 'e',
+        imageName: 'img:2',
+        gpuPoolIds: ['AMPERE_80'],
+        endpointType: 'LOAD_BALANCER',
+        scalerValue: 1.5,
+      });
+      assert.equal(outbound.length, 0);
+      assert.equal(parseText(out).status, 400);
+      assert.match(parseText(out).error as string, /integer >= 1/);
+    });
+  });
+
+  it('create-endpoint v2 allows a fractional scalerValue under QUEUE_DELAY', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'ep_qd' } });
+      await handlers.get('create-endpoint')!({
+        name: 'e',
+        imageName: 'img:2',
+        gpuPoolIds: ['AMPERE_80'],
+        scalerType: 'QUEUE_DELAY',
+        scalerValue: 0.5,
+      });
+      assert.equal(outbound.length, 1);
+      assert.deepEqual(JSON.parse(outbound[0].body!).scaling, {
+        type: 'QUEUE_DELAY',
+        queueDelay: 0.5,
+      });
+    });
+  });
+
+  it('create-endpoint v2 defaults LOAD_BALANCER to the REQUEST_COUNT scaler', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'ep_lb' } });
+      await handlers.get('create-endpoint')!({
+        name: 'e',
+        imageName: 'img:2',
+        gpuPoolIds: ['AMPERE_80'],
+        endpointType: 'LOAD_BALANCER',
+      });
+      const body = JSON.parse(outbound[0].body!);
+      assert.equal(body.type, 'LOAD_BALANCER');
+      assert.deepEqual(body.scaling, {
+        type: 'REQUEST_COUNT',
+        requestCount: 4,
+      });
+    });
+  });
+
+  it('update-endpoint reads the current scaler when only scalerValue is given', async () => {
+    // `scaling` is a union keyed on the scaler type, so changing just the target
+    // needs the endpoint's existing scaler first — a GET, then the PATCH.
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        steps: [
+          { status: 200, jsonBody: { scaling: { type: 'REQUEST_COUNT' } } },
+          { status: 200, jsonBody: { id: 'ep_1' } },
+        ],
+      });
+      await handlers.get('update-endpoint')!({
+        endpointId: 'ep_1',
+        scalerValue: 7,
+      });
+      assert.equal(outbound.length, 2);
+      assert.equal(outbound[0].method, 'GET');
+      assert.equal(
+        outbound[0].url,
+        'https://v2-rest.runpod.io/v2/serverless/ep_1'
+      );
+      assert.equal(outbound[1].method, 'PATCH');
+      assert.deepEqual(JSON.parse(outbound[1].body!).scaling, {
+        type: 'REQUEST_COUNT',
+        requestCount: 7,
+      });
+    });
+  });
+
+  it('update-endpoint rejects a fractional scalerValue against a REQUEST_COUNT endpoint', async () => {
+    // The caller named no scaler, so the bound can only be judged after the GET
+    // resolves it. The PATCH must not go out.
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        steps: [
+          { status: 200, jsonBody: { scaling: { type: 'REQUEST_COUNT' } } },
+        ],
+      });
+      const out = await handlers.get('update-endpoint')!({
+        endpointId: 'ep_1',
+        scalerValue: 7.5,
+      });
+      assert.equal(outbound.length, 1, 'expected the GET only, no PATCH');
+      assert.equal(outbound[0].method, 'GET');
+      assert.equal(parseText(out).status, 400);
+      assert.match(parseText(out).error as string, /integer >= 1/);
+    });
+  });
+
+  it('update-endpoint treats an unrecognized current scaler as QUEUE_DELAY', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        steps: [
+          { status: 200, jsonBody: { scaling: {} } },
+          { status: 200, jsonBody: { id: 'ep_1' } },
+        ],
+      });
+      await handlers.get('update-endpoint')!({
+        endpointId: 'ep_1',
+        scalerValue: 3,
+      });
+      assert.deepEqual(JSON.parse(outbound[1].body!).scaling, {
+        type: 'QUEUE_DELAY',
+        queueDelay: 3,
+      });
+    });
+  });
+
+  it('update-endpoint skips that read when the caller names the scaler', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'ep_1' } });
+      await handlers.get('update-endpoint')!({
+        endpointId: 'ep_1',
+        scalerType: 'QUEUE_DELAY',
+        scalerValue: 3,
+      });
+      assert.equal(outbound.length, 1);
+      assert.equal(outbound[0].method, 'PATCH');
     });
   });
 
@@ -1874,6 +2077,198 @@ describe('v1 catalog GraphQL uses the injected fetch (offline seam)', () => {
     assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
     assert.equal(outbound[0].method, 'POST');
     assert.ok((parseText(out).items as unknown[]).length >= 1);
+  });
+});
+
+// get-job-status queued-job diagnosis: a job stuck IN_QUEUE is ambiguous —
+// crash-looping (UNHEALTHY) workers and a capacity shortage look identical
+// from the job status alone. When the status is IN_QUEUE the tool attaches
+// the endpoint's worker summary + a hint (v2 only, best-effort). These pin
+// the trigger condition, the classification, and that the extra call never
+// breaks the status reply.
+describe('get-job-status — queued-job worker diagnosis', () => {
+  // The diagnosis cache is module-level (it must survive per-request tool
+  // registries); clear it so each case starts fresh.
+  beforeEach(() => clearQueuedJobDiagnosisCache());
+
+  const queued = { id: 'j1', status: 'IN_QUEUE' };
+  const unhealthyWorkers = {
+    summary: {
+      idle: 0,
+      initializing: 0,
+      running: 0,
+      throttled: 0,
+      total: 1,
+      unhealthy: 1,
+    },
+    workers: [{ id: 'w_bad', status: 'UNHEALTHY' }],
+  };
+  const noWorkers = {
+    summary: {
+      idle: 0,
+      initializing: 0,
+      running: 0,
+      throttled: 0,
+      total: 0,
+      unhealthy: 0,
+    },
+    workers: [],
+  };
+
+  it('v2 + IN_QUEUE + UNHEALTHY worker → attaches workerHealth and a crash-loop hint naming the worker', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [queued, unhealthyWorkers],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.equal(outbound.length, 2);
+      assert.equal(outbound[0].url, 'https://api.runpod.ai/v2/ep/status/j1');
+      assert.equal(
+        outbound[1].url,
+        'https://v2-rest.runpod.io/v2/serverless/ep/workers'
+      );
+      const payload = parseText(out);
+      assert.equal(payload.status, 'IN_QUEUE');
+      assert.equal(
+        (payload.workerHealth as { unhealthy: number }).unhealthy,
+        1
+      );
+      assert.match(payload.hint as string, /crash-looping/);
+      assert.match(payload.hint as string, /NOT a capacity shortage/);
+      assert.match(payload.hint as string, /w_bad/);
+    });
+  });
+
+  it('v2 + IN_QUEUE + zero workers → capacity hint', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ jsonBodies: [queued, noWorkers] });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      const payload = parseText(out);
+      assert.match(payload.hint as string, /waiting for GPU capacity/);
+    });
+  });
+
+  it('terminal statuses skip the diagnosis entirely (one outbound call)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [{ id: 'j1', status: 'COMPLETED', output: {} }],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.equal(outbound.length, 1);
+      assert.equal('workerHealth' in parseText(out), false);
+    });
+  });
+
+  it('v1: no workers listing exists → status returned unchanged, no second call', async () => {
+    const { handlers, outbound } = harness({ jsonBodies: [queued] });
+    const out = await handlers.get('get-job-status')!({
+      endpointId: 'ep',
+      jobId: 'j1',
+    });
+    assert.equal(outbound.length, 1);
+    const payload = parseText(out);
+    assert.equal(payload.status, 'IN_QUEUE');
+    assert.equal('workerHealth' in payload, false);
+  });
+
+  it('an unrecognized workers response degrades to the plain status (no crash, no hint)', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ jsonBodies: [queued, { weird: true }] });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      const payload = parseText(out);
+      assert.equal(payload.status, 'IN_QUEUE');
+      assert.equal('workerHealth' in payload, false);
+    });
+  });
+
+  it('throttled workers (none running) → capacity-contention wait hint', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({
+        jsonBodies: [
+          queued,
+          {
+            summary: {
+              idle: 0,
+              initializing: 0,
+              running: 0,
+              throttled: 2,
+              total: 2,
+              unhealthy: 0,
+            },
+            workers: [],
+          },
+        ],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.match(parseText(out).hint as string, /throttled/);
+    });
+  });
+
+  it('initializing worker → cold-start wait hint', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({
+        jsonBodies: [
+          queued,
+          {
+            summary: {
+              idle: 0,
+              initializing: 1,
+              running: 0,
+              throttled: 0,
+              total: 1,
+              unhealthy: 0,
+            },
+            workers: [],
+          },
+        ],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.match(parseText(out).hint as string, /initializing/);
+    });
+  });
+
+  it('caches the diagnosis briefly: rapid polls reuse it instead of refetching workers', async () => {
+    // Agents poll get-job-status in a loop while queued; without the cache every
+    // poll fired a second workers call for an answer that changes on the order
+    // of tens of seconds (Justin's polling-amplification review note).
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [queued, unhealthyWorkers, queued, queued],
+      });
+      const poll = () =>
+        handlers.get('get-job-status')!({ endpointId: 'ep', jobId: 'j1' });
+      const first = parseText(await poll());
+      const second = parseText(await poll());
+      const third = parseText(await poll());
+      // 5 outbound calls, not 6: three status fetches + ONE workers fetch.
+      assert.equal(outbound.length, 4 + 1 - 1);
+      assert.equal(
+        outbound.filter((o) => o.url.includes('/workers')).length,
+        1
+      );
+      // Every poll still carries the (cached) diagnosis.
+      for (const p of [first, second, third]) {
+        assert.match(p.hint as string, /crash-looping/);
+      }
+    });
   });
 });
 
@@ -2774,5 +3169,97 @@ describe('v2 additions surfaced by the spec resync', () => {
       assert.equal((reply.items as unknown[]).length, 2);
       assert.equal(reply.endpointVersion, 12);
     });
+  });
+});
+
+// ============== 401 observer (hosted credential invalidation) ==============
+// The hosted server caches a "credential is valid" verdict. A tool call that
+// 401s proves that verdict wrong before its TTL expires, so the runtime reports
+// it through ToolContext.onUnauthorized and the next request re-checks — that is
+// what lets the server answer 401 + WWW-Authenticate instead of serving another
+// wrapped-200 error for the rest of the TTL.
+describe('ToolContext.onUnauthorized (401 observer)', () => {
+  it('fires when an outbound call answers 401', async () => {
+    let fired = 0;
+    const { handlers } = harness({
+      status: 401,
+      jsonBody: { error: 'Unauthorized' },
+      onUnauthorized: () => fired++,
+    });
+    await assert.rejects(() => handlers.get('list-pods')!({}));
+    assert.equal(fired, 1, 'onUnauthorized was not called for a 401');
+  });
+
+  it('does not fire on success, or on a non-401 failure', async () => {
+    let fired = 0;
+    const ok = harness({ jsonBody: [], onUnauthorized: () => fired++ });
+    await ok.handlers.get('list-pods')!({});
+    assert.equal(fired, 0, 'fired on a 200');
+
+    const forbidden = harness({
+      status: 403,
+      jsonBody: { error: 'Forbidden' },
+      onUnauthorized: () => fired++,
+    });
+    await assert.rejects(() => forbidden.handlers.get('list-pods')!({}));
+    assert.equal(fired, 0, 'fired on a 403 — only 401 means a dead credential');
+  });
+
+  it('is optional — the stdio path registers no observer and still works', async () => {
+    const { handlers, outbound } = harness({ jsonBody: [] });
+    await handlers.get('list-pods')!({});
+    assert.equal(outbound.length, 1);
+  });
+});
+
+// The SSE reader binds its own transport, so it does NOT go through the JSON
+// clients' fetch. It must still report a 401, or a credential that dies during
+// stream-pod-logs / stream-worker-logs is never noticed by the hosted server.
+describe('ToolContext.onUnauthorized — SSE tools', () => {
+  it('fires when the SSE stream itself answers 401', async () => {
+    await withV2(async () => {
+      let fired = 0;
+      const { handlers } = harness({
+        sseStatus: 401,
+        onUnauthorized: () => fired++,
+      });
+      // The tool surfaces the failure in its reply rather than throwing; what
+      // matters here is that the 401 reached the observer either way.
+      await handlers.get('stream-pod-logs')!({ podId: 'p' }).catch(() => {});
+      assert.equal(fired, 1, 'an SSE 401 bypassed the observer');
+    });
+  });
+
+  it('does not fire when the SSE stream answers a non-401 failure', async () => {
+    await withV2(async () => {
+      let fired = 0;
+      const { handlers } = harness({
+        sseStatus: 403,
+        onUnauthorized: () => fired++,
+      });
+      await handlers.get('stream-pod-logs')!({ podId: 'p' }).catch(() => {});
+      assert.equal(fired, 0, 'only a 401 means a dead credential');
+    });
+  });
+});
+
+// The public GraphQL catalog query sends no Authorization header, so a 401 from
+// that host says nothing about the caller's credential. Observing it would drop a
+// good cached verdict and push every caller back through the pre-flight — and
+// under an egress-IP block, every catalog call would do it.
+describe('onUnauthorized ignores the unauthenticated GraphQL path', () => {
+  it('does not fire when the public catalog query 401s', async () => {
+    let fired = 0;
+    const { handlers, outbound } = harness({
+      status: 401,
+      jsonBody: { errors: [{ message: 'blocked' }] },
+      onUnauthorized: () => fired++,
+    });
+    await handlers.get('list-gpu-types')!({}).catch(() => {});
+    assert.ok(
+      outbound.some((c) => c.url.includes('graphql')),
+      'expected the public GraphQL call'
+    );
+    assert.equal(fired, 0, 'a no-credential 401 invalidated the verdict');
   });
 });
