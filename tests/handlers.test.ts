@@ -20,6 +20,7 @@ beforeEach(() => {
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerTools } from '../src/tools.js';
+import { clearQueuedJobDiagnosisCache } from '../src/tools/jobs.js';
 
 // ============== Handler integration / outbound-request golden ==============
 // Drives the REAL registerTools against a fake McpServer (captures handlers) and
@@ -1884,6 +1885,10 @@ describe('v1 catalog GraphQL uses the injected fetch (offline seam)', () => {
 // the trigger condition, the classification, and that the extra call never
 // breaks the status reply.
 describe('get-job-status — queued-job worker diagnosis', () => {
+  // The diagnosis cache is module-level (it must survive per-request tool
+  // registries); clear it so each case starts fresh.
+  beforeEach(() => clearQueuedJobDiagnosisCache());
+
   const queued = { id: 'j1', status: 'IN_QUEUE' };
   const unhealthyWorkers = {
     summary: {
@@ -1983,6 +1988,84 @@ describe('get-job-status — queued-job worker diagnosis', () => {
       const payload = parseText(out);
       assert.equal(payload.status, 'IN_QUEUE');
       assert.equal('workerHealth' in payload, false);
+    });
+  });
+
+  it('throttled workers (none running) → capacity-contention wait hint', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({
+        jsonBodies: [
+          queued,
+          {
+            summary: {
+              idle: 0,
+              initializing: 0,
+              running: 0,
+              throttled: 2,
+              total: 2,
+              unhealthy: 0,
+            },
+            workers: [],
+          },
+        ],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.match(parseText(out).hint as string, /throttled/);
+    });
+  });
+
+  it('initializing worker → cold-start wait hint', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({
+        jsonBodies: [
+          queued,
+          {
+            summary: {
+              idle: 0,
+              initializing: 1,
+              running: 0,
+              throttled: 0,
+              total: 1,
+              unhealthy: 0,
+            },
+            workers: [],
+          },
+        ],
+      });
+      const out = await handlers.get('get-job-status')!({
+        endpointId: 'ep',
+        jobId: 'j1',
+      });
+      assert.match(parseText(out).hint as string, /initializing/);
+    });
+  });
+
+  it('caches the diagnosis briefly: rapid polls reuse it instead of refetching workers', async () => {
+    // Agents poll get-job-status in a loop while queued; without the cache every
+    // poll fired a second workers call for an answer that changes on the order
+    // of tens of seconds (Justin's polling-amplification review note).
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [queued, unhealthyWorkers, queued, queued],
+      });
+      const poll = () =>
+        handlers.get('get-job-status')!({ endpointId: 'ep', jobId: 'j1' });
+      const first = parseText(await poll());
+      const second = parseText(await poll());
+      const third = parseText(await poll());
+      // 5 outbound calls, not 6: three status fetches + ONE workers fetch.
+      assert.equal(outbound.length, 4 + 1 - 1);
+      assert.equal(
+        outbound.filter((o) => o.url.includes('/workers')).length,
+        1
+      );
+      // Every poll still carries the (cached) diagnosis.
+      for (const p of [first, second, third]) {
+        assert.match(p.hint as string, /crash-looping/);
+      }
     });
   });
 });

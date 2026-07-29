@@ -6,6 +6,25 @@ import { READ_ONLY, WRITE, type ToolRuntime } from './runtime.js';
 // Job submission and lifecycle against the Serverless runtime API
 // (api.runpod.ai/v2/{endpointId}/...). Distinct from endpoint CRUD.
 
+// Agents poll get-job-status in a tight loop while a job is queued, and each
+// IN_QUEUE poll would otherwise refetch the same worker list — dozens of
+// identical diagnoses for one queued job. Worker state changes on the order of
+// tens of seconds (scheduling, container starts), so a short-lived cache keyed
+// by endpoint keeps the amplification at one extra call per endpoint per TTL.
+// Module-level so it survives across per-request tool registries on a warm
+// hosted instance; bounded so one-off endpoint ids cannot grow it unbounded.
+const DIAGNOSIS_TTL_MS = 15_000;
+const MAX_DIAGNOSIS_ENTRIES = 500;
+interface CachedDiagnosis {
+  value: { workerHealth: unknown; hint: string };
+  expiresAt: number;
+}
+const diagnosisCache = new Map<string, CachedDiagnosis>();
+// Test seam: module-level state would otherwise leak between test cases.
+export function clearQueuedJobDiagnosisCache(): void {
+  diagnosisCache.clear();
+}
+
 export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
   const { jsonReply, serverlessRequest, backendFor, callRestUrl } = rt;
 
@@ -30,6 +49,11 @@ export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
   async function diagnoseQueuedJob(
     endpointId: string
   ): Promise<{ workerHealth: WorkerSummary; hint: string } | null> {
+    const cached = diagnosisCache.get(endpointId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value as { workerHealth: WorkerSummary; hint: string };
+    }
+    diagnosisCache.delete(endpointId);
     try {
       const backend = backendFor('workers');
       if (backend.version !== 'v2') return null;
@@ -45,37 +69,52 @@ export function registerJobTools(server: McpServer, rt: ToolRuntime): void {
       const workers = raw?.workers ?? [];
       if (!summary) return null;
 
+      const remember = (value: {
+        workerHealth: WorkerSummary;
+        hint: string;
+      }) => {
+        if (diagnosisCache.size >= MAX_DIAGNOSIS_ENTRIES) {
+          const oldest = diagnosisCache.keys().next().value;
+          if (oldest !== undefined) diagnosisCache.delete(oldest);
+        }
+        diagnosisCache.set(endpointId, {
+          value,
+          expiresAt: Date.now() + DIAGNOSIS_TTL_MS,
+        });
+        return value;
+      };
+
       if ((summary.unhealthy ?? 0) > 0) {
         const badIds = workers
           .filter((w) => w.status === 'UNHEALTHY')
           .map((w) => w.id)
           .join(', ');
-        return {
+        return remember({
           workerHealth: summary,
           hint: `${summary.unhealthy} of ${summary.total} worker(s) on this endpoint are UNHEALTHY — the container is likely crash-looping (repeated starts that exit before the handler runs). The job can stay IN_QUEUE indefinitely; this is a worker failure, NOT a capacity shortage. Inspect the logs with stream-worker-logs${
             badIds ? ` (workerId: ${badIds})` : ''
           }.`,
-        };
+        });
       }
       if ((summary.total ?? 0) === 0) {
-        return {
+        return remember({
           workerHealth: summary,
-          hint: 'No workers are scheduled for this endpoint — it is waiting for GPU capacity (or its GPU/CUDA constraints exclude the currently-available hosts). Check availability with list-gpu-types, or widen the gpuIds/CUDA settings.',
-        };
+          hint: 'No workers are scheduled for this endpoint yet — it may simply be scaling up from zero (normal for the first seconds of a cold start), or it is waiting for GPU capacity / its GPU-CUDA constraints exclude the currently-available hosts. If this persists, check availability with list-gpu-types or widen the gpuIds/CUDA settings.',
+        });
       }
       if ((summary.throttled ?? 0) > 0 && (summary.running ?? 0) === 0) {
-        return {
+        return remember({
           workerHealth: summary,
           hint: 'Workers exist but are throttled — the hosts are at capacity right now; the job should start when capacity frees up.',
-        };
+        });
       }
       if ((summary.initializing ?? 0) > 0) {
-        return {
+        return remember({
           workerHealth: summary,
           hint: 'A worker is initializing — likely a cold start (image pull / model load); the job should start soon.',
-        };
+        });
       }
-      return { workerHealth: summary, hint: '' };
+      return remember({ workerHealth: summary, hint: '' });
     } catch {
       return null; // diagnosis is best-effort — never break the status call
     }
