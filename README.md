@@ -200,7 +200,9 @@ The token can be either:
 - a Runpod API key the caller configured manually, or
 - a Runpod API key obtained through the OAuth "Sign in with Runpod" flow (see below).
 
-An unauthenticated request receives a `401` with a `WWW-Authenticate` header pointing at the protected-resource metadata, which tells an OAuth-capable client (such as Claude) to start the sign-in flow. A caller that brings its own API key as the bearer token never hits that path.
+An unauthenticated request receives a `401` with a `WWW-Authenticate` header pointing at the protected-resource metadata, which tells an OAuth-capable client (such as Claude) to start the sign-in flow.
+
+A request whose bearer token is _rejected_ — a revoked key, whether OAuth-minted or supplied by the caller — gets the same `401`, plus `error="invalid_token"` to distinguish it from having sent no credential at all. The token is verified once and the verdict cached briefly. If a credential dies mid-session while a "valid" verdict is still cached, the first call afterward can still surface the upstream 401 as a `200` tool error; that call drops the cached verdict, so the next request re-checks and surfaces a real HTTP `401` that triggers re-authentication. Set `MCP_SKIP_CREDENTIAL_CHECK=true` to disable that verification; it also self-disables when the REST/Serverless hosts and the auth GraphQL host are pointed at different environments, since it would otherwise validate the key against the wrong backend.
 
 ### Sign in with Runpod (authorize flow)
 

@@ -21,6 +21,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup pnpm
+        # Load-bearing pin. `changeset publish` detects the pnpm lockfile and
+        # shells out to `pnpm publish` (NOT `npm publish`), so it is pnpm — not
+        # npm — that carries the OIDC trusted-publishing exchange to npmjs. pnpm
+        # 11 regressed that flow (pnpm/pnpm#11513); 10 works. Do not bump to 11+
+        # without confirming trusted publishing still succeeds, or releases will
+        # fail to authenticate.
         uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -28,11 +34,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # There used to be an `npm i -g npm@latest` step here. It broke every
+          # release from 2026-07-13 on: npm 12 dropped Node 20, so on the Node 20
+          # runner the unpinned install died EBADENGINE — before changesets/action
+          # ran, so neither the version PR nor the publish happened. It has been
+          # deleted rather than fixed because it was pointless: publishing goes
+          # through `pnpm publish` (see the pnpm step above), so the global npm
+          # version does not touch the release at all. Node 24 is only a runner
+          # bump off deprecated Node 20; the published bytes are identical (tsup
+          # targets es2020 from tsconfig, independent of the runner's Node).
+          node-version: 24
           registry-url: https://registry.npmjs.org
-
-      - name: Ensure recent npm (OIDC + provenance support)
-        run: npm i -g npm@latest
 
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
