@@ -3,6 +3,12 @@ import fetch from 'node-fetch';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { handleMcpRequest } from '../src/http.js';
+import {
+  isLoopbackHost,
+  validatePkceAuthorization,
+  validatePkceVerifier,
+  verifyPkce,
+} from '../src/oauth/pkce.js';
 
 // Read the package version at runtime. tsup's build-time `__PACKAGE_VERSION__`
 // define does not run here because Vercel compiles api/index.ts itself, so the
@@ -65,11 +71,6 @@ function getAllowedRedirectUris(): string[] {
   return [...DEFAULT_ALLOWED_REDIRECT_URIS, ...extra];
 }
 
-function isLoopbackHost(hostname: string): boolean {
-  const h = hostname.replace(/^\[|\]$/g, '');
-  return h === 'localhost' || h === '127.0.0.1' || h === '::1';
-}
-
 /**
  * Whether we may deliver the authorization code to this redirect_uri. Loopback
  * (http, any port) is always allowed for native clients; everything else must
@@ -110,6 +111,8 @@ interface FlashAuthRequestStatus {
   id: string;
   status: 'PENDING' | 'APPROVED' | 'DENIED' | 'EXPIRED' | 'CONSUMED';
   apiKey: string | null;
+  codeChallenge: string | null;
+  codeChallengeMethod: string | null;
 }
 
 /**
@@ -153,9 +156,14 @@ async function flashGraphql<T>(query: string, field: string): Promise<T> {
  * Create a pending flash auth request (guest mutation, no auth header) and
  * return its id. The id doubles as the OAuth authorization code.
  */
-async function createFlashAuthRequest(): Promise<string> {
+async function createFlashAuthRequest(codeChallenge: string): Promise<string> {
+  const parts: string[] = [];
   const apiKeyName = getApiKeyName();
-  const args = apiKeyName ? `(apiKeyName: ${JSON.stringify(apiKeyName)})` : '';
+  if (apiKeyName) parts.push(`apiKeyName: ${JSON.stringify(apiKeyName)}`);
+  // These fields require the DR-1398 backend schema to be deployed.
+  parts.push(`codeChallenge: ${JSON.stringify(codeChallenge)}`);
+  parts.push('codeChallengeMethod: "S256"');
+  const args = parts.length ? `(${parts.join(', ')})` : '';
   const data = await flashGraphql<{ id: string }>(
     `mutation { createFlashAuthRequest${args} { id } }`,
     'createFlashAuthRequest'
@@ -171,7 +179,7 @@ async function getFlashAuthStatus(id: string): Promise<FlashAuthRequestStatus> {
   return flashGraphql<FlashAuthRequestStatus>(
     `query { flashAuthRequestStatus(flashAuthRequestId: ${JSON.stringify(
       id
-    )}) { id status apiKey } }`,
+    )}) { id status apiKey codeChallenge codeChallengeMethod } }`,
     'flashAuthRequestStatus'
   );
 }
@@ -236,13 +244,9 @@ function handleAuthorizationServerMetadata(
     grant_types_supported: ['authorization_code'],
     token_endpoint_auth_methods_supported: ['none'],
     // Advertise S256 PKCE so OAuth clients that require it (e.g. Claude Code,
-    // which refuses to start the flow without this field per RFC 8414/8252)
-    // will proceed. NOTE: the code_challenge is not yet verified server-side —
-    // the stateless function has nowhere to bind it across /authorize→/token.
-    // Until enforcement lands (persist code_challenge on the flash auth request
-    // and check the verifier at /token), the flow's real protection remains the
-    // redirect_uri allowlist + single-use, short-lived, human-approved flash
-    // request. Advertising S256 here unblocks clients without weakening that.
+    // per RFC 8414/8252) will start the flow. This is now enforced: /authorize
+    // persists the code_challenge on the flash auth request and /token verifies
+    // the code_verifier against it before returning the key (see verifyPkce).
     code_challenge_methods_supported: ['S256'],
   });
 }
@@ -288,6 +292,10 @@ async function handleAuthorize(
     const requestUrl = new URL(req.url ?? '/', getBaseUrl(req));
     const redirectUri = requestUrl.searchParams.get('redirect_uri');
     const state = requestUrl.searchParams.get('state');
+    const codeChallenge = requestUrl.searchParams.get('code_challenge');
+    const codeChallengeMethod = requestUrl.searchParams.get(
+      'code_challenge_method'
+    );
 
     // Reject before doing anything: the authorization code redeems into a real
     // API key, so we only ever deliver it to an allowlisted redirect_uri.
@@ -301,8 +309,24 @@ async function handleAuthorize(
       return;
     }
 
-    // 1. Create a guest flash auth request; its id is the OAuth code.
-    const requestId = await createFlashAuthRequest();
+    // Require the advertised S256 PKCE policy before issuing an authorization
+    // code. This applies to every client; there is no legacy non-PKCE path.
+    const pkceRequest = validatePkceAuthorization({
+      codeChallenge,
+      codeChallengeMethod,
+    });
+    if (!pkceRequest.ok) {
+      console.warn('oauth_authorize_pkce_rejected');
+      res.status(400).json({
+        error: 'invalid_request',
+        error_description: pkceRequest.error,
+      });
+      return;
+    }
+
+    // 1. Create a guest flash auth request; its id is the OAuth code. The PKCE
+    //    challenge is persisted with it and verified at /token.
+    const requestId = await createFlashAuthRequest(pkceRequest.codeChallenge);
 
     console.log('oauth_authorize', {
       clientId: requestUrl.searchParams.get('client_id'),
@@ -368,13 +392,14 @@ async function handleToken(
   const params = new URLSearchParams(encodeBody(req.body));
   const grantType = params.get('grant_type');
   const code = params.get('code');
+  const codeVerifier = params.get('code_verifier');
 
   console.log('oauth_token_request', {
     grantType,
     hasCode: !!code,
     redirectUri: params.get('redirect_uri'),
     clientId: params.get('client_id'),
-    hasCodeVerifier: !!params.get('code_verifier'),
+    hasCodeVerifier: !!codeVerifier,
   });
 
   if (grantType !== 'authorization_code') {
@@ -402,6 +427,14 @@ async function handleToken(
     return;
   }
 
+  // Reject verifier syntax before reading backend status. An APPROVED status
+  // read consumes the authorization code, so malformed requests must fail first.
+  const verifierRequest = validatePkceVerifier(codeVerifier);
+  if (!verifierRequest.ok) {
+    tokenError(res, 400, 'invalid_grant', verifierRequest.error);
+    return;
+  }
+
   try {
     // The user is redirected back to the client only after approval, so the
     // request is usually already APPROVED. We poll for most of the function's
@@ -420,7 +453,24 @@ async function handleToken(
         attempt,
         status: status.status,
         hasApiKey: !!status.apiKey,
+        hasCodeChallenge: !!status.codeChallenge,
       });
+
+      // PKCE gate — run before honoring an APPROVED request so a missing/wrong
+      // verifier never yields a key. On a PENDING poll this rejects a bad
+      // verifier early, before the user approves. (An APPROVED read consumes the
+      // code atomically in the backend, so a failure there still burns the code;
+      // the key is never returned, which is the property PKCE protects.)
+      const pkceError = verifyPkce({
+        codeChallenge: status.codeChallenge,
+        codeChallengeMethod: status.codeChallengeMethod,
+        codeVerifier: verifierRequest.codeVerifier,
+      });
+      if (pkceError) {
+        console.warn('oauth_token_pkce_rejected', { attempt });
+        tokenError(res, 400, 'invalid_grant', pkceError);
+        return;
+      }
 
       if (status.status === 'APPROVED' || status.status === 'CONSUMED') {
         if (!status.apiKey) {
