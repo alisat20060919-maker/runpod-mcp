@@ -6,7 +6,13 @@ import {
   type CredentialChecker,
   type CredentialCheckerHandle,
 } from './_shared/credential-check.js';
-import { restV1Base, restV2Base, serverlessBase } from './_shared/backend.js';
+import {
+  restV1Base,
+  restV2Base,
+  serverlessBase,
+  authedGraphqlBase,
+  type Env,
+} from './_shared/backend.js';
 import { IncomingMessage, ServerResponse } from 'node:http';
 
 /**
@@ -64,13 +70,16 @@ function writeUnauthorized(
   res.end(JSON.stringify({ error }));
 }
 
-// The GraphQL host the pre-flight authenticates against — the same flash-auth
-// backend the OAuth flow uses. One resolver so the checker and the
-// environment guard below cannot disagree about what "default" means.
+// The GraphQL host the pre-flight authenticates against. This call carries the
+// CALLER'S key, so it uses authedGraphqlBase (RUNPOD_AUTHED_GRAPHQL_URL) — the
+// variable backend.ts reserves for key-bearing GraphQL — NOT the freely
+// repointable OAuth flash-auth var (RUNPOD_GRAPHQL_URL): repointing that one
+// must never redirect every caller's key to an arbitrary host. One resolver so
+// the checker and the environment guard below cannot disagree about defaults.
 function authGraphqlUrl(
   env: NodeJS.ProcessEnv | Record<string, string | undefined>
 ): string {
-  return env.RUNPOD_GRAPHQL_URL || 'https://api.runpod.io/graphql';
+  return authedGraphqlBase(env as Env);
 }
 
 // Shared across requests so the verdict cache helps on a warm instance. Uses the
@@ -94,7 +103,7 @@ function normalizeUrl(raw: string): string {
   }
 }
 
-// The pre-flight checks the token against RUNPOD_GRAPHQL_URL; the tools
+// The pre-flight checks the token against RUNPOD_AUTHED_GRAPHQL_URL; the tools
 // authenticate against the REST/Serverless hosts. Those are independent, so a
 // deployment pointing REST at a dev environment while GraphQL stays on prod
 // would validate a dev key against prod and reject EVERY request — though every
@@ -105,7 +114,7 @@ function normalizeUrl(raw: string): string {
 // There is no .env in the repo, no `env` block in vercel.json, and CI sets no
 // RUNPOD_* vars — the values live only in the Vercel dashboard. If production
 // points any REST host somewhere non-default without also setting
-// RUNPOD_GRAPHQL_URL, this guard is silently disabling the gate in production
+// RUNPOD_AUTHED_GRAPHQL_URL, this guard is silently disabling the gate in production
 // right now. Run `vercel env ls production` to settle it.
 function credentialCheckMayBeWrongEnvironment(env = process.env): boolean {
   // Normalised, not byte-exact: a trailing slash, host casing or an empty string
@@ -300,7 +309,7 @@ function logCredentialCheck(
  * never re-authenticates. Set MCP_SKIP_CREDENTIAL_CHECK=true to disable.
  *
  * The gate also self-disables when the REST hosts are overridden without a
- * matching RUNPOD_GRAPHQL_URL — see credentialCheckMayBeWrongEnvironment.
+ * matching RUNPOD_AUTHED_GRAPHQL_URL — see credentialCheckMayBeWrongEnvironment.
  */
 export async function handleMcpRequest(
   req: IncomingMessage,

@@ -49,9 +49,21 @@ function checkerHarness(opts: {
       calls.push({ url, init });
       if (opts.hang) {
         return new Promise((_resolve, reject) => {
-          init.signal?.addEventListener('abort', () =>
-            reject(new Error('aborted'))
+          // AbortSignal.timeout()'s internal timer is unref'd, so with nothing
+          // else keeping the event loop alive the loop drains BEFORE the abort
+          // fires and node:test cancels the whole file ("Promise resolution is
+          // still pending but the event loop has already resolved") — the CI
+          // failure mode on every Node version. Hold a ref'd timer for slightly
+          // longer than any timeout under test so the abort can actually fire;
+          // clear it the moment it does.
+          const keepAlive = setTimeout(
+            () => {},
+            (opts.timeoutMs ?? 4000) + 1000
           );
+          init.signal?.addEventListener('abort', () => {
+            clearTimeout(keepAlive);
+            reject(new Error('aborted'));
+          });
         });
       }
       if (opts.gate) await opts.gate.wait;
@@ -432,7 +444,7 @@ describe('handleMcpRequest — credential pre-flight', () => {
 });
 
 describe('handleMcpRequest — gate self-disables on environment skew', () => {
-  // The pre-flight validates against RUNPOD_GRAPHQL_URL while tools use the
+  // The pre-flight validates against RUNPOD_AUTHED_GRAPHQL_URL while tools use the
   // REST/serverless hosts. Overriding one without the other means a dev key gets
   // checked against prod, 401s definitively, and EVERY request is rejected even
   // though the tools would work. A wrong 401 is worse than a missed one.
@@ -461,9 +473,12 @@ describe('handleMcpRequest — gate self-disables on environment skew', () => {
   }
 
   for (const v of restVars) {
-    it(`skips the check when ${v} is overridden and RUNPOD_GRAPHQL_URL is not`, async () => {
+    it(`skips the check when ${v} is overridden and RUNPOD_AUTHED_GRAPHQL_URL is not`, async () => {
       await withEnv(
-        { [v]: 'https://dev.example/api', RUNPOD_GRAPHQL_URL: undefined },
+        {
+          [v]: 'https://dev.example/api',
+          RUNPOD_AUTHED_GRAPHQL_URL: undefined,
+        },
         async () => {
           let checkerCalls = 0;
           const { req, res, written } = fakeReqRes({
@@ -491,7 +506,7 @@ describe('handleMcpRequest — gate self-disables on environment skew', () => {
     await withEnv(
       {
         RUNPOD_REST_API_URL: 'https://dev.example/api',
-        RUNPOD_GRAPHQL_URL: 'https://dev.example/graphql',
+        RUNPOD_AUTHED_GRAPHQL_URL: 'https://dev.example/graphql',
       },
       async () => {
         let checkerCalls = 0;
@@ -516,7 +531,7 @@ describe('handleMcpRequest — gate self-disables on environment skew', () => {
         RUNPOD_REST_API_URL: undefined,
         RUNPOD_REST_V2_API_URL: undefined,
         RUNPOD_SERVERLESS_API_URL: undefined,
-        RUNPOD_GRAPHQL_URL: undefined,
+        RUNPOD_AUTHED_GRAPHQL_URL: undefined,
       },
       async () => {
         let checkerCalls = 0;
@@ -538,7 +553,7 @@ describe('handleMcpRequest — gate self-disables on environment skew', () => {
 
 describe('defaultCredentialChecker (the real one, not a stub)', () => {
   // Every other handleMcpRequest test injects a stub, so without this the
-  // production checker — and the RUNPOD_GRAPHQL_URL wiring behind it — is never
+  // production checker — and the RUNPOD_AUTHED_GRAPHQL_URL wiring behind it — is never
   // exercised and a typo there ships silently.
   it('is a usable handle with verify + invalidate', () => {
     assert.equal(typeof defaultCredentialChecker.verify, 'function');
@@ -547,7 +562,7 @@ describe('defaultCredentialChecker (the real one, not a stub)', () => {
     defaultCredentialChecker.invalidate('never-seen-token');
   });
 
-  it('targets RUNPOD_GRAPHQL_URL, defaulting to the production host', async () => {
+  it('targets RUNPOD_AUTHED_GRAPHQL_URL, defaulting to the production host', async () => {
     const seen: string[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL) => {
@@ -558,19 +573,19 @@ describe('defaultCredentialChecker (the real one, not a stub)', () => {
         json: async () => ({ data: { myself: { id: 'u' } } }),
       };
     }) as unknown as typeof globalThis.fetch;
-    const prev = process.env.RUNPOD_GRAPHQL_URL;
+    const prev = process.env.RUNPOD_AUTHED_GRAPHQL_URL;
     try {
-      delete process.env.RUNPOD_GRAPHQL_URL;
+      delete process.env.RUNPOD_AUTHED_GRAPHQL_URL;
       await defaultCredentialChecker.verify('tok-default-host');
       assert.equal(seen[0], 'https://api.runpod.io/graphql');
 
-      process.env.RUNPOD_GRAPHQL_URL = 'https://dev.example/graphql';
+      process.env.RUNPOD_AUTHED_GRAPHQL_URL = 'https://dev.example/graphql';
       await defaultCredentialChecker.verify('tok-override-host');
       assert.equal(seen[1], 'https://dev.example/graphql');
     } finally {
       globalThis.fetch = originalFetch;
-      if (prev === undefined) delete process.env.RUNPOD_GRAPHQL_URL;
-      else process.env.RUNPOD_GRAPHQL_URL = prev;
+      if (prev === undefined) delete process.env.RUNPOD_AUTHED_GRAPHQL_URL;
+      else process.env.RUNPOD_AUTHED_GRAPHQL_URL = prev;
       defaultCredentialChecker.invalidate('tok-default-host');
       defaultCredentialChecker.invalidate('tok-override-host');
     }
@@ -618,14 +633,18 @@ describe('createCredentialChecker — races and eviction order', () => {
       p.resolve({
         ok: status < 300,
         status,
-        json: async () => (status < 300 ? { data: { myself: { id: 'u' } } } : {}),
+        json: async () =>
+          status < 300 ? { data: { myself: { id: 'u' } } } : {},
       });
     };
     const { verify } = createCredentialChecker({
       fetch: (_url, init) =>
         new Promise((resolve) =>
           pending.push({
-            token: (init.headers.Authorization as string).replace('Bearer ', ''),
+            token: (init.headers.Authorization as string).replace(
+              'Bearer ',
+              ''
+            ),
             resolve,
           })
         ),
@@ -650,7 +669,11 @@ describe('createCredentialChecker — races and eviction order', () => {
     const reProbed = pending.length > before;
     if (reProbed) settle('A', 200); // buggy path: cache miss issued a new probe
     assert.equal((await a2).status, 'invalid');
-    assert.equal(reProbed, false, 'A was evicted mid-flight and had to re-probe');
+    assert.equal(
+      reProbed,
+      false,
+      'A was evicted mid-flight and had to re-probe'
+    );
   });
 
   it('evicts least-recently-USED, not merely oldest-inserted', async () => {
@@ -699,7 +722,7 @@ describe('env-mismatch guard keys off the RESOLVED host, not mere presence', () 
       'RUNPOD_REST_API_URL',
       'RUNPOD_REST_V2_API_URL',
       'RUNPOD_SERVERLESS_API_URL',
-      'RUNPOD_GRAPHQL_URL',
+      'RUNPOD_AUTHED_GRAPHQL_URL',
     ];
     const prev = new Map(keys.map((k) => [k, process.env[k]]));
     for (const k of keys) delete process.env[k];
@@ -757,7 +780,7 @@ describe('env-mismatch guard keys off the RESOLVED host, not mere presence', () 
     assert.equal(
       await gateRan({
         RUNPOD_REST_API_URL: 'https://api.runpod.dev/v1',
-        RUNPOD_GRAPHQL_URL: 'https://api.runpod.dev/graphql',
+        RUNPOD_AUTHED_GRAPHQL_URL: 'https://api.runpod.dev/graphql',
       }),
       true
     );
@@ -1058,7 +1081,7 @@ describe('env-mismatch guard ignores cosmetic URL differences', () => {
       'RUNPOD_REST_API_URL',
       'RUNPOD_REST_V2_API_URL',
       'RUNPOD_SERVERLESS_API_URL',
-      'RUNPOD_GRAPHQL_URL',
+      'RUNPOD_AUTHED_GRAPHQL_URL',
     ];
     const prev = new Map(keys.map((k) => [k, process.env[k]]));
     for (const k of keys) delete process.env[k];
@@ -1113,9 +1136,11 @@ describe('env-mismatch guard ignores cosmetic URL differences', () => {
     // Validating a prod key against a non-prod auth backend rejects every good
     // credential just as REST-moved-but-GraphQL-default does. The guard must be
     // bidirectional; an earlier version only caught the REST direction, so this
-    // documented RUNPOD_GRAPHQL_URL dev override 401'd every good key.
+    // documented RUNPOD_AUTHED_GRAPHQL_URL dev override 401'd every good key.
     assert.equal(
-      await gateRuns({ RUNPOD_GRAPHQL_URL: 'http://127.0.0.1:9911/graphql' }),
+      await gateRuns({
+        RUNPOD_AUTHED_GRAPHQL_URL: 'http://127.0.0.1:9911/graphql',
+      }),
       false
     );
   });
@@ -1128,7 +1153,7 @@ describe('env-mismatch guard ignores cosmetic URL differences', () => {
         RUNPOD_REST_API_URL: 'https://api.runpod.dev/v1',
         RUNPOD_REST_V2_API_URL: 'https://api.runpod.dev/v2',
         RUNPOD_SERVERLESS_API_URL: 'https://api.runpod.dev/v2',
-        RUNPOD_GRAPHQL_URL: 'https://api.runpod.dev/graphql',
+        RUNPOD_AUTHED_GRAPHQL_URL: 'https://api.runpod.dev/graphql',
       }),
       true
     );
@@ -1375,7 +1400,7 @@ describe('a disowned in-flight check cannot delete a newer entry', () => {
 });
 
 describe('env guard compares the GraphQL host too, not just its presence', () => {
-  it('setting RUNPOD_GRAPHQL_URL to the prod default does not satisfy the guard', async () => {
+  it('setting RUNPOD_AUTHED_GRAPHQL_URL to the prod default does not satisfy the guard', async () => {
     // Routine ops practice is to set every variable explicitly, including to its
     // default. Testing mere presence meant that satisfied the guard while REST
     // pointed at dev — so a dev key was checked against prod, came back a
@@ -1384,12 +1409,12 @@ describe('env guard compares the GraphQL host too, not just its presence', () =>
       'RUNPOD_REST_API_URL',
       'RUNPOD_REST_V2_API_URL',
       'RUNPOD_SERVERLESS_API_URL',
-      'RUNPOD_GRAPHQL_URL',
+      'RUNPOD_AUTHED_GRAPHQL_URL',
     ];
     const prev = new Map(keys.map((k) => [k, process.env[k]]));
     for (const k of keys) delete process.env[k];
     process.env.RUNPOD_REST_API_URL = 'https://rest.dev.runpod.io/v1';
-    process.env.RUNPOD_GRAPHQL_URL = 'https://api.runpod.io/graphql'; // the default
+    process.env.RUNPOD_AUTHED_GRAPHQL_URL = 'https://api.runpod.io/graphql'; // the default
     let calls = 0;
     try {
       const { req, res } = fakeReqRes({ authorization: 'Bearer rpa_dev' });
