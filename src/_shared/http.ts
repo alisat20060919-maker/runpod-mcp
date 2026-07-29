@@ -1,3 +1,5 @@
+import { rateLimitHint } from './rate-limit.js';
+
 // ============== UNIFIED HTTP CLIENT (REST + Serverless) ==============
 // One authenticated JSON client that replaces the byte-identical
 // `runpodRequest` + `serverlessRequest` helpers. The adapter
@@ -58,26 +60,6 @@ export class HttpError extends Error {
     this.status = status;
     this.body = body;
   }
-}
-
-// A 429's bare "rate limit exceeded" invites the worst possible agent
-// response: retrying immediately. The v2 API sends IETF draft RateLimit
-// headers (e.g. `"minute";r=178;t=44, "hour";r=0;t=1724`) on every response —
-// parse them so the error says WHICH window is exhausted and WHEN it resets,
-// turning a dead end into a wait instruction. Returns a generic back-off hint
-// when the header is absent (v1 sends none).
-export function rateLimitHint(rateLimitHeader: string | null): string {
-  const generic =
-    'rate limited — back off and pace bulk operations; quotas are per minute/hour/day';
-  if (!rateLimitHeader) return generic;
-  // Entries look like: "hour";r=0;t=1724 — r = remaining calls, t = seconds
-  // until the window resets. The exhausted window is the one with r=0.
-  const entries = [...rateLimitHeader.matchAll(/"(\w+)";r=(\d+);t=(\d+)/g)].map(
-    (m) => ({ window: m[1], remaining: Number(m[2]), resetS: Number(m[3]) })
-  );
-  const exhausted = entries.find((e) => e.remaining === 0);
-  if (!exhausted) return generic;
-  return `rate limited — the ${exhausted.window} quota is exhausted; it resets in ~${exhausted.resetS}s. Wait before retrying and pace bulk operations`;
 }
 
 // A response whose content-type marks it as JSON — including v2's RFC-9457
@@ -147,7 +129,10 @@ export function createHttpClient(deps: {
         response.status,
         await response.text(),
         response.status === 429
-          ? rateLimitHint(response.headers.get('ratelimit'))
+          ? rateLimitHint(
+              response.headers.get('ratelimit'),
+              response.headers.get('retry-after')
+            )
           : undefined
       );
     }
