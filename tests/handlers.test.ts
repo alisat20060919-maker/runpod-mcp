@@ -2380,6 +2380,51 @@ describe('get-capacity — GPU × CUDA availability', () => {
   });
 });
 
+// graphqlRequest HTTP-status handling: before this, a non-OK response fell
+// straight into response.json(), so a 429/5xx HTML error page surfaced as an
+// opaque "Unexpected token '<'" parse error. The GraphQL path now mirrors the
+// REST client (#64): HttpError with status + body, and the RateLimit wait
+// hint on 429. Driven through list-gpu-types' v1 path (the public GraphQL
+// seam).
+describe('graphql helper — HTTP-level failures are named, not parse errors', () => {
+  it('429 HTML body → HttpError naming the status with back-off guidance', async () => {
+    const { handlers } = harness({
+      steps: [{ status: 429, text: '<html>Too Many Requests</html>' }],
+      contentType: 'text/html',
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.name === 'HttpError' &&
+        e.message.includes('429') &&
+        /rate limit/i.test(e.message) &&
+        !e.message.includes('Unexpected token')
+    );
+  });
+
+  it('non-OK response with a GraphQL errors body keeps the readable message plus status', async () => {
+    const { handlers } = harness({
+      steps: [
+        { status: 400, text: '{"errors":[{"message":"bad query"}]}' },
+      ],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) => e.message === 'GraphQL Error (HTTP 400): bad query'
+    );
+  });
+
+  it('OK response with a GraphQL errors array is unchanged (golden)', async () => {
+    const { handlers } = harness({
+      jsonBody: { errors: [{ message: 'boom' }] },
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) => e.message === 'GraphQL Error: boom'
+    );
+  });
+});
+
 // get-job-status queued-job diagnosis: a job stuck IN_QUEUE is ambiguous —
 // crash-looping (UNHEALTHY) workers and a capacity shortage look identical
 // from the job status alone. When the status is IN_QUEUE the tool attaches

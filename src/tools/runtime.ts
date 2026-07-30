@@ -1,7 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import fetch from 'node-fetch';
 import { randomUUID } from 'node:crypto';
-import { createHttpClient } from '../_shared/http.js';
+import { createHttpClient, HttpError } from '../_shared/http.js';
+import { rateLimitHint } from '../_shared/rate-limit.js';
 import { buildTrackingHeaders } from '../_shared/tracking.js';
 import { readSseSnapshot, type SseFetch } from './logs.js';
 import {
@@ -243,6 +244,43 @@ async function graphqlRequest<T>(
       ...(options?.variables ? { variables: options.variables } : {}),
     }),
   });
+
+  // HTTP-level failures used to fall through to response.json() and surface
+  // as an opaque parse error ("Unexpected token '<'" for a 429/5xx HTML
+  // body). Handle them like the REST client (http.ts): status + body + a
+  // wait hint on 429. A non-OK response whose body still carries a GraphQL
+  // errors array keeps the readable GraphQL message (servers commonly return
+  // 400 for malformed queries), with the status attached.
+  if (!response.ok) {
+    const bodyText = await response.text();
+    let gqlErrors: Array<{ message: string }> | undefined;
+    try {
+      gqlErrors = (
+        JSON.parse(bodyText) as { errors?: Array<{ message: string }> }
+      ).errors;
+    } catch {
+      // Not JSON (HTML error page, empty body) — the HttpError below carries
+      // the raw body instead.
+    }
+    if (gqlErrors && gqlErrors.length > 0) {
+      throw new Error(
+        `GraphQL Error (HTTP ${response.status}): ${gqlErrors
+          .map((e) => e.message)
+          .join(', ')}`
+      );
+    }
+    throw new HttpError(
+      'Runpod GraphQL Error',
+      response.status,
+      bodyText,
+      response.status === 429
+        ? rateLimitHint(
+            response.headers.get('ratelimit'),
+            response.headers.get('retry-after')
+          )
+        : undefined
+    );
+  }
 
   const result = (await response.json()) as {
     data?: T;
