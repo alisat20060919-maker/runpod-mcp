@@ -353,15 +353,22 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   // catalog tools this one never branches on backendFor.
   server.tool(
     'get-capacity',
-    "GPU capacity across host CUDA versions, as a matrix. Use this to choose an endpoint's allowedCudaVersions/minCudaVersion (or diagnose/widen a capacity-starved one) and to distinguish capacity problems from compatibility problems. Default mode is one call returning, per GPU type, overall stock plus AVAILABLE/UNAVAILABLE per host-reported CUDA version. Pass cudaVersions to deep-probe instead: one stock lookup per listed version, returning graded stock (High/Medium/Low) and the lowest on-demand price per version — in probe mode GPUs with no stock on any probed version are omitted. Credential-free public catalog data; works on both v1 and v2 APIs. Note: the matrix reflects host-reported versions, but endpoint allowedCudaVersions only accepts values from the platform enum — check create-endpoint/update-endpoint for the accepted list.",
+    "GPU capacity across host CUDA versions, as a matrix. Use this to choose an endpoint's allowedCudaVersions/minCudaVersion (or diagnose/widen a capacity-starved one) and to distinguish capacity problems from compatibility problems. Default mode is one call returning, per GPU type, overall stock plus AVAILABLE/UNAVAILABLE per host-reported CUDA version. Pass cudaVersions to deep-probe instead: one stock lookup per listed version, returning graded stock (High/Medium/Low/Out) and the lowest on-demand price per version; a probe that fails transiently reports a per-version error instead of failing the call. Nothing is hidden by default — set includeUnavailable:false to drop GPUs with no stock on any listed version. Credential-free public catalog data; works on both v1 and v2 APIs. Stock is live, so page cursors can shift between calls. Note: the matrix reflects host-reported versions, but endpoint allowedCudaVersions only accepts values from the platform enum — check create-endpoint/update-endpoint for the accepted list.",
     {
       ...listPaginationParams,
       cudaVersions: z
         .array(z.string().regex(/^\d{1,2}\.\d{1,2}$/))
+        .min(1)
         .max(12)
         .optional()
         .describe(
           'Deep-probe these host CUDA versions (e.g. ["12.8", "13.0"], max 12): one stock lookup per version returns graded stock and price. Omit for the single-call AVAILABLE/UNAVAILABLE matrix across all versions the fleet currently reports.'
+        ),
+      includeUnavailable: z
+        .boolean()
+        .optional()
+        .describe(
+          'Out-of-stock GPUs are included by default (explicit "Out" cells / all-UNAVAILABLE rows, sorted last). Set false to hide GPUs with no stock on any listed version.'
         ),
       gpuTypeIds: z
         .array(z.string())
@@ -413,14 +420,19 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         gpuTypes: CapacityGpu[];
       }
 
+      // Blank/non-string filter entries are ignored (an all-blank list means
+      // "no filter", same as omitting it) — a zod-bypassed [""] must not
+      // silently match the whole catalog as if it were a real term.
+      const filterTerms = (params.gpuTypeIds ?? [])
+        .filter((t) => typeof t === 'string' && t.trim().length > 0)
+        .map((t) => t.toLowerCase());
       const matchesFilter = (gpu: CapacityGpu) => {
-        if (!params.gpuTypeIds?.length) return true;
+        if (filterTerms.length === 0) return true;
         const id = gpu.id.toLowerCase();
         const name = gpu.displayName.toLowerCase();
-        return params.gpuTypeIds.some((t) => {
-          const term = t.toLowerCase();
-          return id.includes(term) || name.includes(term);
-        });
+        return filterTerms.some(
+          (term) => id.includes(term) || name.includes(term)
+        );
       };
 
       const stockPriority: Record<string, number> = {
@@ -450,7 +462,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
             }
           }
         `);
-        const rows = data.gpuTypes
+        let rows = data.gpuTypes
           .filter((gpu) => gpu.id !== 'unknown' && matchesFilter(gpu))
           .map((gpu) => {
             const cuda: Record<string, string> = {};
@@ -470,13 +482,16 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
           });
         const availableCount = (r: (typeof rows)[number]) =>
           Object.values(r.cudaVersions).filter((a) => a === 'AVAILABLE').length;
+        if (params.includeUnavailable === false)
+          rows = rows.filter((r) => availableCount(r) > 0);
         rows.sort((a, b) => {
           const diff = availableCount(b) - availableCount(a);
           if (diff !== 0) return diff;
-          return (
+          const stockDiff =
             (stockPriority[b.stockStatus] || 0) -
-            (stockPriority[a.stockStatus] || 0)
-          );
+            (stockPriority[a.stockStatus] || 0);
+          if (stockDiff !== 0) return stockDiff;
+          return b.memoryGb - a.memoryGb;
         });
         return capListResult(rows, {
           limit: params.limit,
@@ -495,7 +510,11 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
           status: 400,
         });
       }
-      const perVersion = await Promise.all(
+      // allSettled, not all: a transient failure (429/5xx) on one probe must
+      // not discard the other versions' results — the same best-effort stance
+      // as get-job-status's worker fan-out. Failed versions are reported in a
+      // probeErrors sibling field instead of failing the call.
+      const perVersion = await Promise.allSettled(
         versions.map((v) =>
           graphql<CapacityResponse>(`
             query {
@@ -515,6 +534,7 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         )
       );
 
+      const probeErrors: Record<string, string> = {};
       const byId = new Map<
         string,
         {
@@ -530,12 +550,16 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         }
       >();
       versions.forEach((v, i) => {
-        for (const gpu of perVersion[i].gpuTypes) {
+        const settled = perVersion[i];
+        if (settled.status === 'rejected') {
+          probeErrors[v] =
+            settled.reason instanceof Error
+              ? settled.reason.message
+              : String(settled.reason);
+          return;
+        }
+        for (const gpu of settled.value.gpuTypes) {
           if (gpu.id === 'unknown' || !matchesFilter(gpu)) continue;
-          const stock = gpu.lowestPrice?.stockStatus;
-          // No stockStatus for this version means no matching hosts — omit the
-          // cell so rows only carry versions with actual capacity.
-          if (!stock || stock === 'Out') continue;
           let row = byId.get(gpu.id);
           if (!row) {
             row = {
@@ -548,18 +572,28 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
             };
             byId.set(gpu.id, row);
           }
-          row.cudaVersions[v] = {
-            stock,
-            pricePerHr: gpu.lowestPrice?.uninterruptablePrice ?? null,
-          };
+          const stock = gpu.lowestPrice?.stockStatus;
+          // No stockStatus means no hosts match this version at all — an
+          // explicit "Out" cell, so starvation is visible rather than an
+          // absence the agent has to infer (a capacity-diagnosis tool must
+          // not hide the empty cells it exists to reveal).
+          row.cudaVersions[v] =
+            !stock || stock === 'Out'
+              ? { stock: 'Out', pricePerHr: null }
+              : {
+                  stock,
+                  pricePerHr: gpu.lowestPrice?.uninterruptablePrice ?? null,
+                };
         }
       });
 
-      const rows = [...byId.values()];
+      let rows = [...byId.values()];
+      const inStockCount = (r: (typeof rows)[number]) =>
+        Object.values(r.cudaVersions).filter((c) => c.stock !== 'Out').length;
+      if (params.includeUnavailable === false)
+        rows = rows.filter((r) => inStockCount(r) > 0);
       rows.sort((a, b) => {
-        const diff =
-          Object.keys(b.cudaVersions).length -
-          Object.keys(a.cudaVersions).length;
+        const diff = inStockCount(b) - inStockCount(a);
         if (diff !== 0) return diff;
         const best = (r: (typeof rows)[number]) =>
           Math.max(
@@ -568,12 +602,17 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
               (c) => stockPriority[c.stock] || 0
             )
           );
-        return best(b) - best(a);
+        const bestDiff = best(b) - best(a);
+        if (bestDiff !== 0) return bestDiff;
+        return b.memoryGb - a.memoryGb;
       });
       return capListResult(
         rows,
         { limit: params.limit, cursor: params.cursor },
-        { probedCudaVersions: versions }
+        {
+          probedCudaVersions: versions,
+          ...(Object.keys(probeErrors).length > 0 ? { probeErrors } : {}),
+        }
       );
     }
   );
