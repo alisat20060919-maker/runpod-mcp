@@ -165,6 +165,23 @@ describe('readSseSnapshot (real reader)', () => {
     );
   });
 
+  it('401 → the error message carries the re-auth hint (the SSE request is always credentialed)', async () => {
+    // Same wiring concern as the 429 above: this path throws its own
+    // HttpError, and the hint no longer comes baked into the constructor —
+    // forgetting the 401 branch here would strip stream-pod-logs /
+    // stream-worker-logs 401s of the hint while every other test stays green.
+    const { fetchImpl } = streamingFetch([], { ok: false, status: 401 });
+    await assert.rejects(
+      () => readSseSnapshot(fetchImpl, 'u', HDRS, BIG),
+      (err: unknown) => {
+        assert.ok(err instanceof HttpError);
+        assert.equal(err.status, 401);
+        assert.match(err.message, /expired or revoked/);
+        return true;
+      }
+    );
+  });
+
   // v2 omits RateLimit for exempt callers, so a 429 can carry no quota headers.
   it('429 with no rate-limit headers → generic hint, no crash', async () => {
     const { fetchImpl } = streamingFetch([], { ok: false, status: 429 });

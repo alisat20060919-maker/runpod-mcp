@@ -1,7 +1,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import fetch from 'node-fetch';
 import { randomUUID } from 'node:crypto';
-import { createHttpClient, HttpError } from '../_shared/http.js';
+import {
+  createHttpClient,
+  EXPIRED_CREDENTIAL_HINT,
+  HttpError,
+} from '../_shared/http.js';
 import { rateLimitHint } from '../_shared/rate-limit.js';
 import { buildTrackingHeaders } from '../_shared/tracking.js';
 import { readSseSnapshot, type SseFetch } from './logs.js';
@@ -266,18 +270,19 @@ async function graphqlRequest<T>(
     // {"errors":"internal failure"}, where a non-empty string passes a
     // .length check and then .map() throws — a worse error than the parse
     // error this handling exists to eliminate. 401/429 fall through to
-    // HttpError even with a GraphQL-shaped body, so the re-auth and
-    // rate-limit hints are never suppressed by a prettier message.
+    // the hinted HttpError below, so the re-auth and rate-limit hints are
+    // never suppressed by a prettier message. Still an HttpError (with the
+    // extracted messages as the body) so `.status` stays machine-readable.
     if (
       Array.isArray(gqlErrors) &&
       gqlErrors.length > 0 &&
       response.status !== 401 &&
       response.status !== 429
     ) {
-      throw new Error(
-        `GraphQL Error (HTTP ${response.status}): ${gqlErrors
-          .map((e) => String(e?.message ?? JSON.stringify(e)))
-          .join(', ')}`
+      throw new HttpError(
+        'Runpod GraphQL Error',
+        response.status,
+        gqlErrors.map((e) => String(e?.message ?? JSON.stringify(e))).join(', ')
       );
     }
     throw new HttpError(
@@ -289,7 +294,13 @@ async function graphqlRequest<T>(
             response.headers.get('ratelimit'),
             response.headers.get('retry-after')
           )
-        : undefined
+        : // Only when this request actually carried the caller's API key: the
+          // public path sends no Authorization header, so a 401 from that
+          // host (WAF, misconfigured RUNPOD_PUBLIC_GRAPHQL_URL) says nothing
+          // about the credential — same rationale as observeUnauthorized.
+          response.status === 401 && options?.apiKey
+          ? EXPIRED_CREDENTIAL_HINT
+          : undefined
     );
   }
 

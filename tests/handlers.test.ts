@@ -2415,13 +2415,16 @@ describe('graphql helper — HTTP-level failures are named, not parse errors', (
 
   it('non-OK response with a GraphQL errors body keeps the readable message plus status', async () => {
     const { handlers } = harness({
-      steps: [
-        { status: 400, text: '{"errors":[{"message":"bad query"}]}' },
-      ],
+      steps: [{ status: 400, text: '{"errors":[{"message":"bad query"}]}' }],
     });
+    // HttpError, not a plain Error: `.status` stays machine-readable so a
+    // caller can branch on it without parsing the message string.
     await assert.rejects(
       handlers.get('list-gpu-types')!({}),
-      (e: Error) => e.message === 'GraphQL Error (HTTP 400): bad query'
+      (e: Error & { status?: number }) =>
+        e.name === 'HttpError' &&
+        e.status === 400 &&
+        e.message === 'Runpod GraphQL Error: 400 - bad query'
     );
   });
 
@@ -2470,16 +2473,41 @@ describe('graphql helper — HTTP-level failures are named, not parse errors', (
     );
   });
 
-  it('401 with a GraphQL errors body still gets the re-auth hint (HttpError wins on 401/429)', async () => {
+  it('public-path 401 carries NO re-auth hint (no credential was sent), even with a GraphQL errors body', async () => {
+    // list-gpu-types goes through the public, credential-free GraphQL path —
+    // a 401 from that host (WAF, misconfigured RUNPOD_PUBLIC_GRAPHQL_URL)
+    // says nothing about the caller's API key, so advising a re-auth would
+    // send an agent off to rotate a credential that was never in play. The
+    // errors-array prettifier still yields to HttpError on 401 so the status
+    // stays front and center.
     const { handlers } = harness({
-      steps: [
-        { status: 401, text: '{"errors":[{"message":"unauthorized"}]}' },
-      ],
+      steps: [{ status: 401, text: '{"errors":[{"message":"unauthorized"}]}' }],
     });
     await assert.rejects(
       handlers.get('list-gpu-types')!({}),
-      (e: Error) =>
-        e.name === 'HttpError' && /expired or revoked/.test(e.message)
+      (e: Error & { status?: number }) =>
+        e.name === 'HttpError' &&
+        e.status === 401 &&
+        !/expired or revoked/.test(e.message)
+    );
+  });
+
+  it('authed-path 401 DOES carry the re-auth hint (the request sent the API key)', async () => {
+    // set-endpoint-gpus' first call is the authenticated `myself.endpoints`
+    // read via graphqlAuthed — the Bearer token was sent, so a 401 really is
+    // about the credential.
+    const { handlers } = harness({
+      steps: [{ status: 401, text: '{"errors":[{"message":"unauthorized"}]}' }],
+    });
+    await assert.rejects(
+      handlers.get('set-endpoint-gpus')!({
+        endpointId: 'ep_x',
+        gpuIds: 'AMPERE_16',
+      }),
+      (e: Error & { status?: number }) =>
+        e.name === 'HttpError' &&
+        e.status === 401 &&
+        /expired or revoked/.test(e.message)
     );
   });
 
