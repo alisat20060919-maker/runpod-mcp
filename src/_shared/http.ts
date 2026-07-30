@@ -53,8 +53,16 @@ export class HttpError extends Error {
       status === 401
         ? ' (the Runpod API rejected the credential — the API key may be expired or revoked; re-authenticate or update RUNPOD_API_KEY)'
         : '';
+    // The body is embedded in the message for readability but capped: a WAF or
+    // proxy error page can run to hundreds of KB, and the message lands
+    // verbatim in an agent's context. `.body` keeps the full text for
+    // programmatic callers.
+    const shownBody =
+      body.length > 2048
+        ? `${body.slice(0, 2048)}… [truncated ${body.length - 2048} chars]`
+        : body;
     super(
-      `${prefix}: ${status} - ${body}${authHint}${hint ? ` (${hint})` : ''}`
+      `${prefix}: ${status} - ${shownBody}${authHint}${hint ? ` (${hint})` : ''}`
     );
     this.name = 'HttpError';
     this.status = status;

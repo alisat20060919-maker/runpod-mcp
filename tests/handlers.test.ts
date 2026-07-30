@@ -48,7 +48,15 @@ function harness(opts?: {
   // single-response options once exhausted). For handlers that make more than one
   // call with DIFFERENT statuses — e.g. update-endpoint's scaler lookup followed
   // by the PATCH.
-  steps?: Array<{ status?: number; jsonBody?: unknown; text?: string }>;
+  steps?: Array<{
+    status?: number;
+    jsonBody?: unknown;
+    text?: string;
+    // Extra response headers for this step (lowercase names), consulted
+    // before the content-type fallback — lets a test exercise header-driven
+    // paths like the 429 RateLimit hint.
+    headers?: Record<string, string>;
+  }>;
   // Fake SSE reader for stream-pod-logs (the real one uses node-fetch directly,
   // bypassing the injected fetch). Records its calls and returns canned text.
   streamSse?: (
@@ -100,10 +108,13 @@ function harness(opts?: {
       ok: status >= 200 && status < 300,
       status,
       headers: {
-        get: (n: string) =>
-          n.toLowerCase() === 'content-type'
+        get: (n: string) => {
+          const fromStep = step?.headers?.[n.toLowerCase()];
+          if (fromStep !== undefined) return fromStep;
+          return n.toLowerCase() === 'content-type'
             ? (opts?.contentType ?? 'application/json')
-            : null,
+            : null;
+        },
       },
       json: async () => jsonBody,
       text: async () => step?.text ?? '',
@@ -2421,6 +2432,68 @@ describe('graphql helper — HTTP-level failures are named, not parse errors', (
     await assert.rejects(
       handlers.get('list-gpu-types')!({}),
       (e: Error) => e.message === 'GraphQL Error: boom'
+    );
+  });
+
+  it('429 with a RateLimit header names the exhausted window and reset in the hint', async () => {
+    const { handlers } = harness({
+      steps: [
+        {
+          status: 429,
+          text: 'rate limit exceeded',
+          headers: { ratelimit: '"minute";r=0;t=120' },
+        },
+      ],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.message.includes('429') &&
+        /minute/.test(e.message) &&
+        /120/.test(e.message)
+    );
+  });
+
+  it('non-array "errors" in a non-OK JSON body → HttpError, not a TypeError', async () => {
+    // Proxies/WAFs emit {"errors":"..."} — a non-empty string passes a
+    // .length check; the Array.isArray guard must route this to HttpError.
+    const { handlers } = harness({
+      steps: [{ status: 502, text: '{"errors":"internal failure"}' }],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.name === 'HttpError' &&
+        e.message.includes('502') &&
+        e.message.includes('internal failure') &&
+        !e.message.includes('is not a function')
+    );
+  });
+
+  it('401 with a GraphQL errors body still gets the re-auth hint (HttpError wins on 401/429)', async () => {
+    const { handlers } = harness({
+      steps: [
+        { status: 401, text: '{"errors":[{"message":"unauthorized"}]}' },
+      ],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.name === 'HttpError' && /expired or revoked/.test(e.message)
+    );
+  });
+
+  it('huge non-JSON error body is truncated in the message but preserved on .body', async () => {
+    const { handlers } = harness({
+      steps: [{ status: 500, text: 'x'.repeat(5000) }],
+      contentType: 'text/html',
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error & { body?: string }) =>
+        e.message.includes('truncated') &&
+        e.message.length < 3000 &&
+        e.body?.length === 5000
     );
   });
 });

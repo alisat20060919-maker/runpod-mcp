@@ -262,10 +262,21 @@ async function graphqlRequest<T>(
       // Not JSON (HTML error page, empty body) — the HttpError below carries
       // the raw body instead.
     }
-    if (gqlErrors && gqlErrors.length > 0) {
+    // Array.isArray, not truthiness: proxies/WAFs emit shapes like
+    // {"errors":"internal failure"}, where a non-empty string passes a
+    // .length check and then .map() throws — a worse error than the parse
+    // error this handling exists to eliminate. 401/429 fall through to
+    // HttpError even with a GraphQL-shaped body, so the re-auth and
+    // rate-limit hints are never suppressed by a prettier message.
+    if (
+      Array.isArray(gqlErrors) &&
+      gqlErrors.length > 0 &&
+      response.status !== 401 &&
+      response.status !== 429
+    ) {
       throw new Error(
         `GraphQL Error (HTTP ${response.status}): ${gqlErrors
-          .map((e) => e.message)
+          .map((e) => String(e?.message ?? JSON.stringify(e)))
           .join(', ')}`
       );
     }
