@@ -125,6 +125,7 @@ function harness(opts?: {
             sseFetch: async () => ({
               ok: opts.sseStatus! >= 200 && opts.sseStatus! < 300,
               status: opts.sseStatus!,
+              headers: { get: () => null },
               text: async () => 'denied',
               body: null,
             }),
@@ -3239,6 +3240,24 @@ describe('ToolContext.onUnauthorized — SSE tools', () => {
       });
       await handlers.get('stream-pod-logs')!({ podId: 'p' }).catch(() => {});
       assert.equal(fired, 0, 'only a 401 means a dead credential');
+    });
+  });
+
+  // The SSE reader builds its own HttpError and reads response headers to do
+  // it. A 429 must come back as a classified reply, not a TypeError thrown
+  // past the handler's `instanceof HttpError` catch.
+  it('an SSE 429 comes back as a 429 reply, not a thrown TypeError', async () => {
+    await withV2(async () => {
+      const { handlers } = harness({ sseStatus: 429 });
+      const out = (await handlers.get('stream-pod-logs')!({
+        podId: 'p',
+      })) as { content: { text: string }[] };
+      const reply = JSON.parse(out.content[0].text) as {
+        error: string;
+        status: number;
+      };
+      assert.equal(reply.status, 429);
+      assert.match(reply.error, /rate limited/);
     });
   });
 });

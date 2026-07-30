@@ -1,3 +1,5 @@
+import { rateLimitHint } from './rate-limit.js';
+
 // ============== UNIFIED HTTP CLIENT (REST + Serverless) ==============
 // One authenticated JSON client that replaces the byte-identical
 // `runpodRequest` + `serverlessRequest` helpers. The adapter
@@ -19,7 +21,10 @@ interface RequestInitLike {
   body?: string;
 }
 
-type FetchLike = (url: string, init: RequestInitLike) => Promise<HttpResponseLike>;
+type FetchLike = (
+  url: string,
+  init: RequestInitLike
+) => Promise<HttpResponseLike>;
 
 interface HttpResponseLike {
   ok: boolean;
@@ -37,16 +42,20 @@ interface HttpResponseLike {
 export class HttpError extends Error {
   readonly status: number;
   readonly body: string;
-  constructor(prefix: string, status: number, body: string) {
+  constructor(prefix: string, status: number, body: string, hint?: string) {
     // A 401 means the credential itself is dead (expired/revoked key), not
     // that the request was wrong. Say so — a bare "401 - Unauthorized" gives
     // an agent nothing actionable, and on stdio (env-var API key) there is no
-    // HTTP layer to convert this into a re-auth signal.
-    const hint =
+    // HTTP layer to convert this into a re-auth signal. Status-specific hints
+    // that need response context (e.g. 429's RateLimit header) are passed in
+    // by the caller via `hint` instead.
+    const authHint =
       status === 401
         ? ' (the Runpod API rejected the credential — the API key may be expired or revoked; re-authenticate or update RUNPOD_API_KEY)'
         : '';
-    super(`${prefix}: ${status} - ${body}${hint}`);
+    super(
+      `${prefix}: ${status} - ${body}${authHint}${hint ? ` (${hint})` : ''}`
+    );
     this.name = 'HttpError';
     this.status = status;
     this.body = body;
@@ -118,7 +127,13 @@ export function createHttpClient(deps: {
       throw new HttpError(
         deps.errorPrefix,
         response.status,
-        await response.text()
+        await response.text(),
+        response.status === 429
+          ? rateLimitHint(
+              response.headers.get('ratelimit'),
+              response.headers.get('retry-after')
+            )
+          : undefined
       );
     }
 
