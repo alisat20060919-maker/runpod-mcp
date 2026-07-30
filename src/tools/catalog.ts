@@ -349,8 +349,11 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   );
 
   // Get capacity (GPU × host-CUDA availability). Public GraphQL on both API
-  // versions — the v2 REST catalog has no CUDA dimension, so unlike the other
-  // catalog tools this one never branches on backendFor.
+  // versions — the v2 REST catalog's only CUDA dimension is a minCudaVersion
+  // floor filter on availability (see MinCudaVersionFilter in the vendored
+  // spec); the exact per-version breakdown, per-version graded stock, and
+  // per-version pricing this tool returns are GraphQL-only, so unlike the
+  // other catalog tools this one never branches on backendFor.
   server.tool(
     'get-capacity',
     "GPU capacity across host CUDA versions, as a matrix. Use this to choose an endpoint's allowedCudaVersions/minCudaVersion (or diagnose/widen a capacity-starved one) and to distinguish capacity problems from compatibility problems. Default mode is one call returning, per GPU type, overall stock plus AVAILABLE/UNAVAILABLE per host-reported CUDA version. Pass cudaVersions to deep-probe instead: one stock lookup per listed version, returning graded stock (High/Medium/Low/Out) and the lowest on-demand price per version; a probe that fails transiently reports a per-version error instead of failing the call. Nothing is hidden by default — set includeUnavailable:false to drop GPUs with no stock on any listed version. Credential-free public catalog data; works on both v1 and v2 APIs. Stock is live, so page cursors can shift between calls. Note: the matrix reflects host-reported versions, but endpoint allowedCudaVersions only accepts values from the platform enum — check create-endpoint/update-endpoint for the accepted list.",
