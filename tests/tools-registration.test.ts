@@ -69,6 +69,7 @@ const EXPECTED_TOOLS = [
   'get-gpu-type',
   'get-cpu-type',
   'get-data-center',
+  'get-capacity',
   // hub
   'list-hub-repos',
   'deploy-hub-repo',

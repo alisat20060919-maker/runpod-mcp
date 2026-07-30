@@ -348,6 +348,236 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
     }
   );
 
+  // Get capacity (GPU × host-CUDA availability). Public GraphQL on both API
+  // versions — the v2 REST catalog has no CUDA dimension, so unlike the other
+  // catalog tools this one never branches on backendFor.
+  server.tool(
+    'get-capacity',
+    "GPU capacity across host CUDA versions, as a matrix. Use this to choose an endpoint's allowedCudaVersions/minCudaVersion (or diagnose/widen a capacity-starved one) and to distinguish capacity problems from compatibility problems. Default mode is one call returning, per GPU type, overall stock plus AVAILABLE/UNAVAILABLE per host-reported CUDA version. Pass cudaVersions to deep-probe instead: one stock lookup per listed version, returning graded stock (High/Medium/Low) and the lowest on-demand price per version — in probe mode GPUs with no stock on any probed version are omitted. Credential-free public catalog data; works on both v1 and v2 APIs. Note: the matrix reflects host-reported versions, but endpoint allowedCudaVersions only accepts values from the platform enum — check create-endpoint/update-endpoint for the accepted list.",
+    {
+      ...listPaginationParams,
+      cudaVersions: z
+        .array(z.string().regex(/^\d{1,2}\.\d{1,2}$/))
+        .max(12)
+        .optional()
+        .describe(
+          'Deep-probe these host CUDA versions (e.g. ["12.8", "13.0"], max 12): one stock lookup per version returns graded stock and price. Omit for the single-call AVAILABLE/UNAVAILABLE matrix across all versions the fleet currently reports.'
+        ),
+      gpuTypeIds: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Filter to GPU types matching any of these ids or display names (case-insensitive substring, e.g. ['NVIDIA GeForce RTX 4090'] or ['4090', 'H200'])."
+        ),
+      gpuCount: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe('GPUs per worker/pod to check stock for (default 1).'),
+      secureCloudOnly: z
+        .boolean()
+        .optional()
+        .describe('Restrict the stock lookup to Secure Cloud hosts.'),
+    },
+    { title: 'Get GPU capacity by CUDA version', ...READ_ONLY },
+    async (params) => {
+      // The public GraphQL path takes no variables, so arguments are inlined.
+      // Every inlined value is re-validated here at runtime (not just in zod)
+      // because direct handler calls can bypass schema validation: gpuCount is
+      // coerced to an int in [1,8], cudaVersions is regex-checked below, and
+      // secureCloud is a literal.
+      const gpuCount = Math.min(
+        8,
+        Math.max(1, Math.floor(Number(params.gpuCount)) || 1)
+      );
+      const secureArg = params.secureCloudOnly ? ', secureCloud: true' : '';
+
+      interface CapacityGpu {
+        id: string;
+        displayName: string;
+        memoryInGb: number;
+        secureCloud: boolean;
+        communityCloud: boolean;
+        lowestPrice?: {
+          stockStatus: string | null;
+          uninterruptablePrice: number | null;
+          gpuTypeCudaVersions?: Array<{
+            cudaVersion: string;
+            availability: string;
+          }> | null;
+        } | null;
+      }
+      interface CapacityResponse {
+        gpuTypes: CapacityGpu[];
+      }
+
+      const matchesFilter = (gpu: CapacityGpu) => {
+        if (!params.gpuTypeIds?.length) return true;
+        const id = gpu.id.toLowerCase();
+        const name = gpu.displayName.toLowerCase();
+        return params.gpuTypeIds.some((t) => {
+          const term = t.toLowerCase();
+          return id.includes(term) || name.includes(term);
+        });
+      };
+
+      const stockPriority: Record<string, number> = {
+        High: 3,
+        Medium: 2,
+        Low: 1,
+      };
+
+      // Matrix mode: one query, per-version availability from the fleet.
+      if (!params.cudaVersions?.length) {
+        const data = await graphql<CapacityResponse>(`
+          query {
+            gpuTypes {
+              id
+              displayName
+              memoryInGb
+              secureCloud
+              communityCloud
+              lowestPrice(input: { gpuCount: ${gpuCount}${secureArg} }) {
+                stockStatus
+                uninterruptablePrice
+                gpuTypeCudaVersions {
+                  cudaVersion
+                  availability
+                }
+              }
+            }
+          }
+        `);
+        const rows = data.gpuTypes
+          .filter((gpu) => gpu.id !== 'unknown' && matchesFilter(gpu))
+          .map((gpu) => {
+            const cuda: Record<string, string> = {};
+            for (const c of gpu.lowestPrice?.gpuTypeCudaVersions ?? []) {
+              cuda[c.cudaVersion] = c.availability;
+            }
+            return {
+              id: gpu.id,
+              displayName: gpu.displayName,
+              memoryGb: gpu.memoryInGb,
+              secureCloud: gpu.secureCloud,
+              communityCloud: gpu.communityCloud,
+              stockStatus: gpu.lowestPrice?.stockStatus || 'unavailable',
+              pricePerHr: gpu.lowestPrice?.uninterruptablePrice ?? null,
+              cudaVersions: cuda,
+            };
+          });
+        const availableCount = (r: (typeof rows)[number]) =>
+          Object.values(r.cudaVersions).filter((a) => a === 'AVAILABLE').length;
+        rows.sort((a, b) => {
+          const diff = availableCount(b) - availableCount(a);
+          if (diff !== 0) return diff;
+          return (
+            (stockPriority[b.stockStatus] || 0) -
+            (stockPriority[a.stockStatus] || 0)
+          );
+        });
+        return capListResult(rows, {
+          limit: params.limit,
+          cursor: params.cursor,
+        });
+      }
+
+      // Probe mode: one stock lookup per requested version, merged per GPU.
+      // Zod caps at 12, but the cap is re-enforced here because direct handler
+      // calls (tests, other transports) can bypass schema validation.
+      const versions = [...new Set(params.cudaVersions)].slice(0, 12);
+      const invalid = versions.filter((v) => !/^\d{1,2}\.\d{1,2}$/.test(v));
+      if (invalid.length > 0) {
+        return jsonReply({
+          error: `Invalid CUDA version format: ${invalid.join(', ')}. Use "major.minor" strings like "12.8".`,
+          status: 400,
+        });
+      }
+      const perVersion = await Promise.all(
+        versions.map((v) =>
+          graphql<CapacityResponse>(`
+            query {
+              gpuTypes {
+                id
+                displayName
+                memoryInGb
+                secureCloud
+                communityCloud
+                lowestPrice(input: { gpuCount: ${gpuCount}, allowedCudaVersions: ["${v}"]${secureArg} }) {
+                  stockStatus
+                  uninterruptablePrice
+                }
+              }
+            }
+          `)
+        )
+      );
+
+      const byId = new Map<
+        string,
+        {
+          id: string;
+          displayName: string;
+          memoryGb: number;
+          secureCloud: boolean;
+          communityCloud: boolean;
+          cudaVersions: Record<
+            string,
+            { stock: string; pricePerHr: number | null }
+          >;
+        }
+      >();
+      versions.forEach((v, i) => {
+        for (const gpu of perVersion[i].gpuTypes) {
+          if (gpu.id === 'unknown' || !matchesFilter(gpu)) continue;
+          const stock = gpu.lowestPrice?.stockStatus;
+          // No stockStatus for this version means no matching hosts — omit the
+          // cell so rows only carry versions with actual capacity.
+          if (!stock || stock === 'Out') continue;
+          let row = byId.get(gpu.id);
+          if (!row) {
+            row = {
+              id: gpu.id,
+              displayName: gpu.displayName,
+              memoryGb: gpu.memoryInGb,
+              secureCloud: gpu.secureCloud,
+              communityCloud: gpu.communityCloud,
+              cudaVersions: {},
+            };
+            byId.set(gpu.id, row);
+          }
+          row.cudaVersions[v] = {
+            stock,
+            pricePerHr: gpu.lowestPrice?.uninterruptablePrice ?? null,
+          };
+        }
+      });
+
+      const rows = [...byId.values()];
+      rows.sort((a, b) => {
+        const diff =
+          Object.keys(b.cudaVersions).length -
+          Object.keys(a.cudaVersions).length;
+        if (diff !== 0) return diff;
+        const best = (r: (typeof rows)[number]) =>
+          Math.max(
+            0,
+            ...Object.values(r.cudaVersions).map(
+              (c) => stockPriority[c.stock] || 0
+            )
+          );
+        return best(b) - best(a);
+      });
+      return capListResult(
+        rows,
+        { limit: params.limit, cursor: params.cursor },
+        { probedCudaVersions: versions }
+      );
+    }
+  );
+
   // Get Data Center by id (v2-only — GET /v2/catalog/datacenters/{id})
   server.tool(
     'get-data-center',
