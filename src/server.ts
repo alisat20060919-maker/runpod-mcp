@@ -10,6 +10,14 @@ export const SERVER_NAME = 'Runpod API Server';
 export const SERVER_VERSION =
   typeof __PACKAGE_VERSION__ !== 'undefined' ? __PACKAGE_VERSION__ : 'dev';
 
+// Sent to clients in the `initialize` response. Most MCP clients prepend this
+// to the model's context, so it is the one place to point agents at the full
+// API surface when a curated tool doesn't expose the field or parameter they
+// need.
+export const SERVER_INSTRUCTIONS = `These tools cover common Runpod operations, but they are curated projections: the underlying APIs expose more fields and parameters than the tools surface.
+
+When you need data or capability beyond these tools, consult the full API contracts directly. The REST v2 API is machine-readable at https://api.runpod.io/v2/openapi.json (fetch and search it to enumerate every path, parameter, and response schema). REST v1 at https://rest.runpod.io/v1 is deprecated; prefer v2. The GraphQL API at https://api.runpod.io/graphql (Bearer auth with a Runpod API key) exposes some data with no REST equivalent, such as per-worker host machine details. Its schema is documented at https://graphql-spec.runpod.io/; introspection is disabled in production, so use that reference rather than __schema queries.`;
+
 // `version` defaults to the build-time value (correct for the npm/stdio build).
 // The hosted entrypoint passes a runtime value read from package.json, since
 // tsup's define doesn't run when Vercel compiles api/index.ts.
@@ -18,12 +26,17 @@ export const SERVER_VERSION =
 // `2.0.0 [RUNPOD_REST_VERSION=v2]`, so a plain `initialize` handshake shows at a
 // glance whether the deployment is running v1 or v2 without env inspection.
 export function createServer(version: string = SERVER_VERSION): McpServer {
-  return new McpServer({
-    name: SERVER_NAME,
-    version: `${version} [${restVersionSummary(process.env as Env)}]`,
-    capabilities: {
-      resources: {},
-      tools: {},
+  return new McpServer(
+    {
+      name: SERVER_NAME,
+      version: `${version} [${restVersionSummary(process.env as Env)}]`,
     },
-  });
+    {
+      capabilities: {
+        resources: {},
+        tools: {},
+      },
+      instructions: SERVER_INSTRUCTIONS,
+    },
+  );
 }
