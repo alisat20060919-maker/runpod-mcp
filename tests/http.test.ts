@@ -430,4 +430,28 @@ describe('createHttpClient — 429 hint wiring', () => {
       /Runpod API Error: 500 - boom$/
     );
   });
+
+  it('a 401 carries the re-auth hint (every request this client sends is credentialed)', async () => {
+    // The hint moved out of the HttpError constructor (the public GraphQL
+    // path must be able to omit it), so this pins that the REST client still
+    // wires it in — without it, a stdio agent with a revoked key gets a bare
+    // "401 - Unauthorized" and nothing actionable.
+    const client = createHttpClient({
+      apiKey: 'k',
+      fetch: fakeFetch(
+        fakeResponse({ status: 401, ok: false, textBody: 'Unauthorized' })
+      ),
+      tracking: noTracking,
+      errorPrefix: 'Runpod API Error',
+    });
+    await assert.rejects(
+      () => client('http://x'),
+      (err: unknown) => {
+        assert.ok(err instanceof HttpError);
+        assert.equal(err.status, 401);
+        assert.match(err.message, /expired or revoked/);
+        return true;
+      }
+    );
+  });
 });

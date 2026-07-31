@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { HttpError } from '../_shared/http.js';
+import { EXPIRED_CREDENTIAL_HINT, HttpError } from '../_shared/http.js';
 import { rateLimitHint } from '../_shared/rate-limit.js';
 import type { Backend, Resource } from '../_shared/backend.js';
 import type { StreamSse, ToolRuntime } from './runtime.js';
@@ -103,14 +103,18 @@ export async function readSseSnapshot(
         'Runpod API Error',
         res.status,
         await res.text().catch(() => ''),
-        // This throw bypasses createHttpClient, so the 429 hint is built
-        // here too or these two tools alone return a bare 429.
+        // This throw bypasses createHttpClient, so the status hints are built
+        // here too or these two tools alone return a bare 429/401. The 401
+        // hint applies: this request always carries Authorization (see the
+        // headers bound in runtime.ts streamSse).
         res.status === 429
           ? rateLimitHint(
               res.headers.get('ratelimit'),
               res.headers.get('retry-after')
             )
-          : undefined
+          : res.status === 401
+            ? EXPIRED_CREDENTIAL_HINT
+            : undefined
       );
     }
     for await (const chunk of (res.body ?? []) as AsyncIterable<Buffer>) {

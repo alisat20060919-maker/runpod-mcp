@@ -48,7 +48,15 @@ function harness(opts?: {
   // single-response options once exhausted). For handlers that make more than one
   // call with DIFFERENT statuses — e.g. update-endpoint's scaler lookup followed
   // by the PATCH.
-  steps?: Array<{ status?: number; jsonBody?: unknown; text?: string }>;
+  steps?: Array<{
+    status?: number;
+    jsonBody?: unknown;
+    text?: string;
+    // Extra response headers for this step (lowercase names), consulted
+    // before the content-type fallback — lets a test exercise header-driven
+    // paths like the 429 RateLimit hint.
+    headers?: Record<string, string>;
+  }>;
   // Fake SSE reader for stream-pod-logs (the real one uses node-fetch directly,
   // bypassing the injected fetch). Records its calls and returns canned text.
   streamSse?: (
@@ -100,10 +108,13 @@ function harness(opts?: {
       ok: status >= 200 && status < 300,
       status,
       headers: {
-        get: (n: string) =>
-          n.toLowerCase() === 'content-type'
+        get: (n: string) => {
+          const fromStep = step?.headers?.[n.toLowerCase()];
+          if (fromStep !== undefined) return fromStep;
+          return n.toLowerCase() === 'content-type'
             ? (opts?.contentType ?? 'application/json')
-            : null,
+            : null;
+        },
       },
       json: async () => jsonBody,
       text: async () => step?.text ?? '',
@@ -2377,6 +2388,141 @@ describe('get-capacity — GPU × CUDA availability', () => {
     const parsed = parseText(out);
     assert.equal(parsed.status, 400);
     assert.ok(String(parsed.error).includes('Invalid CUDA version'));
+  });
+});
+
+// graphqlRequest HTTP-status handling: before this, a non-OK response fell
+// straight into response.json(), so a 429/5xx HTML error page surfaced as an
+// opaque "Unexpected token '<'" parse error. The GraphQL path now mirrors the
+// REST client (#64): HttpError with status + body, and the RateLimit wait
+// hint on 429. Driven through list-gpu-types' v1 path (the public GraphQL
+// seam).
+describe('graphql helper — HTTP-level failures are named, not parse errors', () => {
+  it('429 HTML body → HttpError naming the status with back-off guidance', async () => {
+    const { handlers } = harness({
+      steps: [{ status: 429, text: '<html>Too Many Requests</html>' }],
+      contentType: 'text/html',
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.name === 'HttpError' &&
+        e.message.includes('429') &&
+        /rate limit/i.test(e.message) &&
+        !e.message.includes('Unexpected token')
+    );
+  });
+
+  it('non-OK response with a GraphQL errors body keeps the readable message plus status', async () => {
+    const { handlers } = harness({
+      steps: [{ status: 400, text: '{"errors":[{"message":"bad query"}]}' }],
+    });
+    // HttpError, not a plain Error: `.status` stays machine-readable so a
+    // caller can branch on it without parsing the message string.
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error & { status?: number }) =>
+        e.name === 'HttpError' &&
+        e.status === 400 &&
+        e.message === 'Runpod GraphQL Error: 400 - bad query'
+    );
+  });
+
+  it('OK response with a GraphQL errors array is unchanged (golden)', async () => {
+    const { handlers } = harness({
+      jsonBody: { errors: [{ message: 'boom' }] },
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) => e.message === 'GraphQL Error: boom'
+    );
+  });
+
+  it('429 with a RateLimit header names the exhausted window and reset in the hint', async () => {
+    const { handlers } = harness({
+      steps: [
+        {
+          status: 429,
+          text: 'rate limit exceeded',
+          headers: { ratelimit: '"minute";r=0;t=120' },
+        },
+      ],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.message.includes('429') &&
+        /minute/.test(e.message) &&
+        /120/.test(e.message)
+    );
+  });
+
+  it('non-array "errors" in a non-OK JSON body → HttpError, not a TypeError', async () => {
+    // Proxies/WAFs emit {"errors":"..."} — a non-empty string passes a
+    // .length check; the Array.isArray guard must route this to HttpError.
+    const { handlers } = harness({
+      steps: [{ status: 502, text: '{"errors":"internal failure"}' }],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error) =>
+        e.name === 'HttpError' &&
+        e.message.includes('502') &&
+        e.message.includes('internal failure') &&
+        !e.message.includes('is not a function')
+    );
+  });
+
+  it('public-path 401 carries NO re-auth hint (no credential was sent), even with a GraphQL errors body', async () => {
+    // list-gpu-types goes through the public, credential-free GraphQL path —
+    // a 401 from that host (WAF, misconfigured RUNPOD_PUBLIC_GRAPHQL_URL)
+    // says nothing about the caller's API key, so advising a re-auth would
+    // send an agent off to rotate a credential that was never in play. The
+    // errors-array prettifier still yields to HttpError on 401 so the status
+    // stays front and center.
+    const { handlers } = harness({
+      steps: [{ status: 401, text: '{"errors":[{"message":"unauthorized"}]}' }],
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error & { status?: number }) =>
+        e.name === 'HttpError' &&
+        e.status === 401 &&
+        !/expired or revoked/.test(e.message)
+    );
+  });
+
+  it('authed-path 401 DOES carry the re-auth hint (the request sent the API key)', async () => {
+    // set-endpoint-gpus' first call is the authenticated `myself.endpoints`
+    // read via graphqlAuthed — the Bearer token was sent, so a 401 really is
+    // about the credential.
+    const { handlers } = harness({
+      steps: [{ status: 401, text: '{"errors":[{"message":"unauthorized"}]}' }],
+    });
+    await assert.rejects(
+      handlers.get('set-endpoint-gpus')!({
+        endpointId: 'ep_x',
+        gpuIds: 'AMPERE_16',
+      }),
+      (e: Error & { status?: number }) =>
+        e.name === 'HttpError' &&
+        e.status === 401 &&
+        /expired or revoked/.test(e.message)
+    );
+  });
+
+  it('huge non-JSON error body is truncated in the message but preserved on .body', async () => {
+    const { handlers } = harness({
+      steps: [{ status: 500, text: 'x'.repeat(5000) }],
+      contentType: 'text/html',
+    });
+    await assert.rejects(
+      handlers.get('list-gpu-types')!({}),
+      (e: Error & { body?: string }) =>
+        e.message.includes('truncated') &&
+        e.message.length < 3000 &&
+        e.body?.length === 5000
+    );
   });
 });
 
