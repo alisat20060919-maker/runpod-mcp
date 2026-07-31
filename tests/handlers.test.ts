@@ -2081,6 +2081,305 @@ describe('v1 catalog GraphQL uses the injected fetch (offline seam)', () => {
   });
 });
 
+// get-capacity: GPU × host-CUDA availability. Both modes go through the
+// public GraphQL catalog regardless of REST version, so these goldens pin the
+// outbound query shape (matrix vs per-version probe) and the row mapping.
+describe('get-capacity — GPU × CUDA availability', () => {
+  const matrixGpu = (over: Record<string, unknown>) => ({
+    id: 'NVIDIA GeForce RTX 4090',
+    displayName: 'RTX 4090',
+    memoryInGb: 24,
+    secureCloud: true,
+    communityCloud: true,
+    lowestPrice: {
+      stockStatus: 'Low',
+      uninterruptablePrice: 0.34,
+      gpuTypeCudaVersions: [
+        { cudaVersion: '12.8', availability: 'AVAILABLE' },
+        { cudaVersion: '13.0', availability: 'AVAILABLE' },
+      ],
+    },
+    ...over,
+  });
+
+  it('matrix mode → ONE public GraphQL call requesting gpuTypeCudaVersions; maps rows, sorts most-available first', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: {
+        data: {
+          gpuTypes: [
+            matrixGpu({
+              id: 'NVIDIA H100 80GB HBM3',
+              displayName: 'H100 SXM',
+              lowestPrice: {
+                stockStatus: 'High',
+                uninterruptablePrice: 2.69,
+                gpuTypeCudaVersions: [
+                  { cudaVersion: '12.8', availability: 'UNAVAILABLE' },
+                  { cudaVersion: '13.0', availability: 'AVAILABLE' },
+                ],
+              },
+            }),
+            matrixGpu({}),
+            // The catalog's NONE-stock placeholder must never leak into rows.
+            matrixGpu({ id: 'unknown' }),
+          ],
+        },
+      },
+    });
+    const out = await handlers.get('get-capacity')!({});
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].url, 'https://api.runpod.io/graphql');
+    const body = JSON.parse(outbound[0].body!) as { query: string };
+    assert.ok(body.query.includes('gpuTypeCudaVersions'));
+    assert.ok(body.query.includes('gpuCount: 1'));
+    assert.ok(!body.query.includes('allowedCudaVersions'));
+    const parsed = parseText(out);
+    const items = parsed.items as Array<Record<string, unknown>>;
+    // unknown sentinel dropped; 4090 (2 AVAILABLE) sorts above H100 (1).
+    assert.equal(items.length, 2);
+    assert.equal(items[0].id, 'NVIDIA GeForce RTX 4090');
+    assert.deepEqual(items[0].cudaVersions, {
+      '12.8': 'AVAILABLE',
+      '13.0': 'AVAILABLE',
+    });
+    assert.equal(items[1].stockStatus, 'High');
+  });
+
+  it('matrix mode gpuTypeIds filters by case-insensitive id/displayName substring', async () => {
+    const { handlers } = harness({
+      jsonBody: {
+        data: {
+          gpuTypes: [
+            matrixGpu({}),
+            matrixGpu({ id: 'NVIDIA H200', displayName: 'H200 SXM' }),
+          ],
+        },
+      },
+    });
+    const out = await handlers.get('get-capacity')!({
+      gpuTypeIds: ['h200'],
+    });
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].id, 'NVIDIA H200');
+  });
+
+  it('probe mode → one call per version with allowedCudaVersions inlined; merges per-GPU cells and omits no-stock GPUs', async () => {
+    const probeGpus = (stock128: string | null, stock130: string | null) => [
+      {
+        data: {
+          gpuTypes: [
+            {
+              id: 'NVIDIA GeForce RTX 4090',
+              displayName: 'RTX 4090',
+              memoryInGb: 24,
+              secureCloud: true,
+              communityCloud: true,
+              lowestPrice: stock128
+                ? { stockStatus: stock128, uninterruptablePrice: 0.34 }
+                : null,
+            },
+            {
+              id: 'NVIDIA L4',
+              displayName: 'L4',
+              memoryInGb: 24,
+              secureCloud: true,
+              communityCloud: false,
+              lowestPrice: null,
+            },
+          ],
+        },
+      },
+      {
+        data: {
+          gpuTypes: [
+            {
+              id: 'NVIDIA GeForce RTX 4090',
+              displayName: 'RTX 4090',
+              memoryInGb: 24,
+              secureCloud: true,
+              communityCloud: true,
+              lowestPrice: stock130
+                ? { stockStatus: stock130, uninterruptablePrice: 0.34 }
+                : null,
+            },
+            {
+              id: 'NVIDIA L4',
+              displayName: 'L4',
+              memoryInGb: 24,
+              secureCloud: true,
+              communityCloud: false,
+              lowestPrice: null,
+            },
+          ],
+        },
+      },
+    ];
+    const { handlers, outbound } = harness({
+      jsonBodies: probeGpus('Low', 'Medium'),
+    });
+    const out = await handlers.get('get-capacity')!({
+      cudaVersions: ['12.8', '13.0'],
+    });
+    assert.equal(outbound.length, 2);
+    const q1 = (JSON.parse(outbound[0].body!) as { query: string }).query;
+    const q2 = (JSON.parse(outbound[1].body!) as { query: string }).query;
+    assert.ok(q1.includes('allowedCudaVersions: ["12.8"]'));
+    assert.ok(q2.includes('allowedCudaVersions: ["13.0"]'));
+    const parsed = parseText(out);
+    assert.deepEqual(parsed.probedCudaVersions, ['12.8', '13.0']);
+    const items = parsed.items as Array<Record<string, unknown>>;
+    // Nothing hidden by default: L4 (no stock on either version) is included
+    // with explicit Out cells and sorts last.
+    assert.equal(items.length, 2);
+    assert.equal(items[0].id, 'NVIDIA GeForce RTX 4090');
+    assert.deepEqual(items[0].cudaVersions, {
+      '12.8': { stock: 'Low', pricePerHr: 0.34 },
+      '13.0': { stock: 'Medium', pricePerHr: 0.34 },
+    });
+    assert.deepEqual(items[1].cudaVersions, {
+      '12.8': { stock: 'Out', pricePerHr: null },
+      '13.0': { stock: 'Out', pricePerHr: null },
+    });
+  });
+
+  it('probe mode includeUnavailable:false hides GPUs with no stock on any probed version', async () => {
+    const gpus = (stock: string | null) => ({
+      data: {
+        gpuTypes: [
+          {
+            id: 'NVIDIA GeForce RTX 4090',
+            displayName: 'RTX 4090',
+            memoryInGb: 24,
+            secureCloud: true,
+            communityCloud: true,
+            lowestPrice: stock
+              ? { stockStatus: stock, uninterruptablePrice: 0.34 }
+              : null,
+          },
+          {
+            id: 'NVIDIA L4',
+            displayName: 'L4',
+            memoryInGb: 24,
+            secureCloud: true,
+            communityCloud: false,
+            lowestPrice: { stockStatus: 'Out', uninterruptablePrice: null },
+          },
+        ],
+      },
+    });
+    const { handlers } = harness({ jsonBodies: [gpus('Low')] });
+    const out = await handlers.get('get-capacity')!({
+      cudaVersions: ['12.8'],
+      includeUnavailable: false,
+    });
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].id, 'NVIDIA GeForce RTX 4090');
+  });
+
+  it('probe mode survives a failed version: allSettled keeps good results and reports probeErrors', async () => {
+    const good = {
+      data: {
+        gpuTypes: [
+          {
+            id: 'NVIDIA GeForce RTX 4090',
+            displayName: 'RTX 4090',
+            memoryInGb: 24,
+            secureCloud: true,
+            communityCloud: true,
+            lowestPrice: { stockStatus: 'Low', uninterruptablePrice: 0.34 },
+          },
+        ],
+      },
+    };
+    const bad = { errors: [{ message: 'rate limited' }] };
+    const { handlers, outbound } = harness({ jsonBodies: [good, bad] });
+    const out = await handlers.get('get-capacity')!({
+      cudaVersions: ['12.8', '13.0'],
+    });
+    assert.equal(outbound.length, 2);
+    const parsed = parseText(out);
+    const items = parsed.items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 1);
+    assert.deepEqual(items[0].cudaVersions, {
+      '12.8': { stock: 'Low', pricePerHr: 0.34 },
+    });
+    const errs = parsed.probeErrors as Record<string, string>;
+    assert.ok(errs['13.0'].includes('rate limited'));
+    assert.equal(errs['12.8'], undefined);
+  });
+
+  it('probe mode dedupes repeated versions before querying', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [{ data: { gpuTypes: [] } }],
+    });
+    const out = await handlers.get('get-capacity')!({
+      cudaVersions: ['12.8', '12.8', '12.8'],
+    });
+    assert.equal(outbound.length, 1);
+    assert.deepEqual(parseText(out).probedCudaVersions, ['12.8']);
+  });
+
+  it('gpuCount is runtime-coerced into the wire query (zod bypassed): 9999 → 8, non-numeric → 1', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: { data: { gpuTypes: [] } },
+    });
+    await handlers.get('get-capacity')!({ gpuCount: 9999 });
+    await handlers.get('get-capacity')!({ gpuCount: '8; }) { x }' });
+    const q1 = (JSON.parse(outbound[0].body!) as { query: string }).query;
+    const q2 = (JSON.parse(outbound[1].body!) as { query: string }).query;
+    assert.ok(q1.includes('gpuCount: 8'));
+    assert.ok(q2.includes('gpuCount: 1'));
+    assert.ok(!q2.includes('8; }'));
+  });
+
+  it('matrix mode secureCloudOnly inlines secureCloud: true; blank gpuTypeIds entries mean no filter', async () => {
+    const { handlers, outbound } = harness({
+      jsonBody: {
+        data: {
+          gpuTypes: [matrixGpu({}), matrixGpu({ id: 'NVIDIA H200' })],
+        },
+      },
+    });
+    const out = await handlers.get('get-capacity')!({
+      secureCloudOnly: true,
+      gpuTypeIds: ['', '   '],
+    });
+    const q = (JSON.parse(outbound[0].body!) as { query: string }).query;
+    assert.ok(q.includes('secureCloud: true'));
+    // All-blank filter treated as "no filter", not match-everything-by-accident.
+    const items = parseText(out).items as Array<Record<string, unknown>>;
+    assert.equal(items.length, 2);
+  });
+
+  it('probe mode secureCloudOnly inlines secureCloud: true into the query', async () => {
+    const { handlers, outbound } = harness({
+      jsonBodies: [{ data: { gpuTypes: [] } }],
+    });
+    await handlers.get('get-capacity')!({
+      cudaVersions: ['12.8'],
+      secureCloudOnly: true,
+    });
+    const q = (JSON.parse(outbound[0].body!) as { query: string }).query;
+    assert.ok(q.includes('secureCloud: true'));
+  });
+
+  it('probe mode rejects malformed version strings with a 400 reply (handler-level guard, zod bypassed)', async () => {
+    const { handlers, outbound } = harness({});
+    // Direct handler calls skip schema validation — the injection guard must
+    // hold on its own. This string would otherwise break out of the inlined
+    // GraphQL argument.
+    const out = await handlers.get('get-capacity')!({
+      cudaVersions: ['12.8"] }) { id } }'],
+    });
+    assert.equal(outbound.length, 0);
+    const parsed = parseText(out);
+    assert.equal(parsed.status, 400);
+    assert.ok(String(parsed.error).includes('Invalid CUDA version'));
+  });
+});
+
 // get-job-status queued-job diagnosis: a job stuck IN_QUEUE is ambiguous —
 // crash-looping (UNHEALTHY) workers and a capacity shortage look identical
 // from the job status alone. When the status is IN_QUEUE the tool attaches
