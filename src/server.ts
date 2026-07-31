@@ -32,8 +32,10 @@ export function createServer(version: string = SERVER_VERSION): McpServer {
       version: `${version} [${restVersionSummary(process.env as Env)}]`,
     },
     {
+      // Only advertise capabilities the server implements. It registers
+      // tools and no resources — advertising `resources` would invite
+      // `resources/list` calls that answer -32601.
       capabilities: {
-        resources: {},
         tools: {},
       },
       instructions: SERVER_INSTRUCTIONS,
