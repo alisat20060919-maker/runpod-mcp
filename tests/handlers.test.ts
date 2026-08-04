@@ -484,7 +484,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: { pods: [] } });
       await handlers.get('list-pods')!({ computeType: 'GPU', name: 'x' });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods');
       assert.equal(outbound[0].method, 'GET');
     });
   });
@@ -510,7 +510,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
         includeMachine: true,
         includeNetworkVolume: true,
       });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods/pod_7');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods/pod_7');
       assert.equal(outbound[0].method, 'GET');
     });
   });
@@ -527,7 +527,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
         volumeInGb: 40,
         volumeMountPath: '/workspace',
       });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods');
       assert.equal(outbound[0].method, 'POST');
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.image, 'img:1');
@@ -550,7 +550,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
         gpuTypeIds: ['A100'],
         volumeInGb: 40,
       });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods');
       const body = JSON.parse(outbound[0].body!);
       assert.equal('mounts' in body, false);
     });
@@ -684,11 +684,11 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       // 1) template GET
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/templates/tpl_1'
+        'https://api.runpod.io/v2/templates/tpl_1'
       );
       assert.equal(outbound[0].method, 'GET');
       // 2) pod POST with the template's container config folded in
-      assert.equal(outbound[1].url, 'https://v2-rest.runpod.io/v2/pods');
+      assert.equal(outbound[1].url, 'https://api.runpod.io/v2/pods');
       assert.equal(outbound[1].method, 'POST');
       const body = JSON.parse(outbound[1].body!);
       assert.equal(body.image, 'runpod/pytorch:2.8.0');
@@ -834,7 +834,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     try {
       const { handlers, outbound } = harness({ jsonBody: { pods: [] } });
       return handlers.get('list-pods')!({}).then(() => {
-        assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods');
+        assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods');
       });
     } finally {
       if (prev === undefined) delete process.env.RUNPOD_REST_VERSION_PODS;
@@ -848,7 +848,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       await handlers.get('stop-pod')!({ podId: 'pod_9' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/pods/pod_9/action'
+        'https://api.runpod.io/v2/pods/pod_9/action'
       );
       assert.equal(outbound[0].method, 'POST');
       assert.deepEqual(JSON.parse(outbound[0].body!), { action: 'stop' });
@@ -861,7 +861,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       await handlers.get('start-pod')!({ podId: 'pod_1' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/pods/pod_1/action'
+        'https://api.runpod.io/v2/pods/pod_1/action'
       );
       assert.deepEqual(JSON.parse(outbound[0].body!), { action: 'start' });
     });
@@ -873,7 +873,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       await handlers.get('restart-pod')!({ podId: 'pod_1' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/pods/pod_1/action'
+        'https://api.runpod.io/v2/pods/pod_1/action'
       );
       assert.deepEqual(JSON.parse(outbound[0].body!), { action: 'restart' });
     });
@@ -883,7 +883,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: {} });
       await handlers.get('update-pod')!({ podId: 'pod_2', imageName: 'i2' });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods/pod_2');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods/pod_2');
       assert.equal(outbound[0].method, 'PATCH');
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.image, 'i2');
@@ -896,7 +896,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: {} });
       await handlers.get('delete-pod')!({ podId: 'pod_x' });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/pods/pod_x');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/pods/pod_x');
       assert.equal(outbound[0].method, 'DELETE');
     });
   });
@@ -907,7 +907,7 @@ describe('template / network-volume / registry routing under v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: { templates: [] } });
       await handlers.get('list-templates')!({ includeRunpodTemplates: true });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/templates');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/templates');
     });
   });
 
@@ -919,7 +919,7 @@ describe('template / network-volume / registry routing under v2', () => {
         imageName: 'i',
         isServerless: true,
       });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/templates');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/templates');
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.image, 'i');
       assert.equal('imageName' in body, false);
@@ -938,7 +938,7 @@ describe('template / network-volume / registry routing under v2', () => {
       await handlers.get('list-network-volumes')!({});
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/network-volumes'
+        'https://api.runpod.io/v2/network-volumes'
       );
     });
   });
@@ -953,7 +953,7 @@ describe('template / network-volume / registry routing under v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/network-volumes'
+        'https://api.runpod.io/v2/network-volumes'
       );
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.dataCenter, 'EU-RO-1');
@@ -967,7 +967,7 @@ describe('template / network-volume / registry routing under v2', () => {
       await handlers.get('get-network-volume')!({ networkVolumeId: 'nv_1' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/network-volumes/nv_1'
+        'https://api.runpod.io/v2/network-volumes/nv_1'
       );
     });
   });
@@ -981,7 +981,7 @@ describe('template / network-volume / registry routing under v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/templates/t_1'
+        'https://api.runpod.io/v2/templates/t_1'
       );
       assert.equal(outbound[0].method, 'PATCH');
       const body = JSON.parse(outbound[0].body!);
@@ -1000,7 +1000,7 @@ describe('template / network-volume / registry routing under v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/network-volumes/nv_1'
+        'https://api.runpod.io/v2/network-volumes/nv_1'
       );
       assert.equal(outbound[0].method, 'PATCH');
       assert.equal('networkVolumeId' in JSON.parse(outbound[0].body!), false);
@@ -1011,7 +1011,7 @@ describe('template / network-volume / registry routing under v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: { registries: [] } });
       await handlers.get('list-container-registry-auths')!({});
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/registries');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/registries');
     });
   });
 
@@ -1027,7 +1027,7 @@ describe('template / network-volume / registry routing under v2', () => {
       const out = await handlers.get('list-registry-delegations')!({});
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/registries/delegations'
+        'https://api.runpod.io/v2/registries/delegations'
       );
       assert.equal(outbound[0].method, 'GET');
       assert.equal((parseText(out).items as unknown[]).length, 3);
@@ -1051,7 +1051,7 @@ describe('template / network-volume / registry routing under v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/registries/delegations'
+        'https://api.runpod.io/v2/registries/delegations'
       );
       assert.equal(outbound[0].method, 'POST');
       assert.deepEqual(JSON.parse(outbound[0].body!), {
@@ -1079,7 +1079,7 @@ describe('template / network-volume / registry routing under v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/registries/delegations/deleg%2F1'
+        'https://api.runpod.io/v2/registries/delegations/deleg%2F1'
       );
       assert.equal(outbound[0].method, 'DELETE');
     });
@@ -1090,7 +1090,7 @@ describe('template / network-volume / registry routing under v2', () => {
       const { handlers, outbound } = harness({ jsonBody: {} });
       const params = { name: 'r', username: 'u', password: 'p' };
       await handlers.get('create-container-registry-auth')!({ ...params });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/registries');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/registries');
       assert.deepEqual(JSON.parse(outbound[0].body!), params);
     });
   });
@@ -1103,7 +1103,7 @@ describe('template / network-volume / registry routing under v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/registries/cra_1'
+        'https://api.runpod.io/v2/registries/cra_1'
       );
       assert.equal(outbound[0].method, 'DELETE');
     });
@@ -1136,7 +1136,7 @@ describe('catalog routing (B5)', () => {
       })) as { content: Array<{ text: string }> };
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus?include=AVAILABILITY'
+        'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY'
       );
       const payload = JSON.parse(out.content[0].text).items;
       assert.equal(payload.length, 1);
@@ -1201,7 +1201,7 @@ describe('catalog routing (B5)', () => {
       })) as { content: Array<{ text: string }> };
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus'
+        'https://api.runpod.io/v2/catalog/gpus'
       );
       // no availability data → nothing filtered out
       assert.equal(JSON.parse(out.content[0].text).items.length, 2);
@@ -1278,7 +1278,7 @@ describe('catalog routing (B5)', () => {
       })) as { content: Array<{ text: string }> };
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/datacenters'
+        'https://api.runpod.io/v2/catalog/datacenters'
       );
       const payload = JSON.parse(out.content[0].text).items;
       assert.equal(payload.length, 1);
@@ -1308,7 +1308,7 @@ describe('catalog routing (B5)', () => {
       };
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/cpus'
+        'https://api.runpod.io/v2/catalog/cpus'
       );
       assert.deepEqual(JSON.parse(out.content[0].text).items, [
         { id: 'cpu5c' },
@@ -1336,7 +1336,7 @@ describe('catalog routing (B5)', () => {
       // availability is requested by default
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY'
+        'https://api.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY'
       );
       // raw passthrough (no unwrap) — body preserved
       assert.deepEqual(JSON.parse(out.content[0].text), {
@@ -1355,7 +1355,7 @@ describe('catalog routing (B5)', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090'
+        'https://api.runpod.io/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090'
       );
     });
   });
@@ -1467,7 +1467,7 @@ describe('billing tool (v2-only)', () => {
         jsonBody: { records, metadata: { total: 123 } },
       });
       const out = await handlers.get('get-billing')!({});
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/billing');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/billing');
       const env = parseText(out);
       assert.equal((env.pagination as { total: number }).total, 25);
       assert.equal((env.items as unknown[]).length, 20);
@@ -1498,7 +1498,7 @@ describe('billing tool (v2-only)', () => {
       await handlers.get('get-billing')!({ scope: 'pods', lastN: 5 });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/billing/pods?lastN=5'
+        'https://api.runpod.io/v2/billing/pods?lastN=5'
       );
     });
   });
@@ -1525,7 +1525,7 @@ describe('list-endpoint-workers (v2-only)', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1/workers'
+        'https://api.runpod.io/v2/serverless/ep_1/workers'
       );
       const env = parseText(out);
       assert.equal((env.items as unknown[]).length, 3);
@@ -1548,7 +1548,7 @@ describe('catalog gets (v2-only)', () => {
       await handlers.get('get-cpu-type')!({ cpuTypeId: 'cpu5c' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/cpus/cpu5c'
+        'https://api.runpod.io/v2/catalog/cpus/cpu5c'
       );
     });
   });
@@ -1565,7 +1565,7 @@ describe('catalog gets (v2-only)', () => {
       await handlers.get('get-data-center')!({ dataCenterId: 'EU-RO-1' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/catalog/datacenters/EU-RO-1'
+        'https://api.runpod.io/v2/catalog/datacenters/EU-RO-1'
       );
     });
   });
@@ -1614,7 +1614,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       const out = await handlers.get('list-endpoints')!({
         includeWorkers: true, // v1-only param, must be dropped on v2
       });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/serverless');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/serverless');
       assert.equal(outbound[0].method, 'GET');
       assert.equal((parseText(out).items as unknown[]).length, 2);
     });
@@ -1629,7 +1629,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1'
+        'https://api.runpod.io/v2/serverless/ep_1'
       );
     });
   });
@@ -1654,7 +1654,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
         flashboot: 'FLASHBOOT',
         containerRegistryAuthId: 'cra_1',
       });
-      assert.equal(outbound[0].url, 'https://v2-rest.runpod.io/v2/serverless');
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/serverless');
       assert.equal(outbound[0].method, 'POST');
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.name, 'e');
@@ -1825,7 +1825,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       assert.equal(outbound[0].method, 'GET');
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1'
+        'https://api.runpod.io/v2/serverless/ep_1'
       );
       assert.equal(outbound[1].method, 'PATCH');
       assert.deepEqual(JSON.parse(outbound[1].body!).scaling, {
@@ -1897,7 +1897,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1'
+        'https://api.runpod.io/v2/serverless/ep_1'
       );
       assert.equal(outbound[0].method, 'PATCH');
       const body = JSON.parse(outbound[0].body!);
@@ -1913,7 +1913,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       await handlers.get('delete-endpoint')!({ endpointId: 'ep_1' });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1'
+        'https://api.runpod.io/v2/serverless/ep_1'
       );
       assert.equal(outbound[0].method, 'DELETE');
     });
@@ -2006,7 +2006,7 @@ describe('log streaming tools (v2-only)', () => {
       // `source: both` is the default → NO source query param.
       assert.equal(
         calls[0].url,
-        'https://v2-rest.runpod.io/v2/pods/pod_1/logs'
+        'https://api.runpod.io/v2/pods/pod_1/logs'
       );
       assert.equal(calls[0].maxWaitMs, 5000);
       assert.equal(calls[0].maxBytes, 256 * 1024);
@@ -2036,7 +2036,7 @@ describe('log streaming tools (v2-only)', () => {
       });
       assert.equal(
         calls[0].url,
-        'https://v2-rest.runpod.io/v2/pods/pod_2/logs?source=container&tail=50&since=2026-05-01T22%3A00%3A00Z'
+        'https://api.runpod.io/v2/pods/pod_2/logs?source=container&tail=50&since=2026-05-01T22%3A00%3A00Z'
       );
       assert.equal(calls[0].maxWaitMs, 8000);
     });
@@ -2054,7 +2054,7 @@ describe('log streaming tools (v2-only)', () => {
       });
       assert.equal(
         calls[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1/workers/w_9/logs?source=system&tail=0'
+        'https://api.runpod.io/v2/serverless/ep_1/workers/w_9/logs?source=system&tail=0'
       );
       assert.equal(parseText(out).count, 2);
     });
@@ -2574,7 +2574,7 @@ describe('get-job-status — queued-job worker diagnosis', () => {
       assert.equal(outbound[0].url, 'https://api.runpod.ai/v2/ep/status/j1');
       assert.equal(
         outbound[1].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep/workers'
+        'https://api.runpod.io/v2/serverless/ep/workers'
       );
       const payload = parseText(out);
       assert.equal(payload.status, 'IN_QUEUE');
@@ -3608,7 +3608,7 @@ describe('v2 additions surfaced by the spec resync', () => {
       });
       assert.equal(
         outbound[0].url,
-        'https://v2-rest.runpod.io/v2/serverless/ep_1/releases'
+        'https://api.runpod.io/v2/serverless/ep_1/releases'
       );
       assert.equal(outbound[0].method, 'GET');
       const reply = parseText(out);
