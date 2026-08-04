@@ -760,7 +760,7 @@ describe('env-mismatch guard keys off the RESOLVED host, not mere presence', () 
       true
     );
     assert.equal(
-      await gateRan({ RUNPOD_REST_V2_API_URL: 'https://v2-rest.runpod.io/v2' }),
+      await gateRan({ RUNPOD_REST_V2_API_URL: 'https://api.runpod.io/v2' }),
       true
     );
     assert.equal(
