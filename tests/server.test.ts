@@ -23,9 +23,10 @@ describe('createServer initialize handshake', () => {
   it('reports serverInfo without stray capabilities', async () => {
     const client = await connect();
     const serverInfo = client.getServerVersion();
-    assert.equal(serverInfo?.name, SERVER_NAME);
-    assert.match(serverInfo?.version ?? '', /^0\.0\.0-test \[RUNPOD_REST_VERSION/);
-    assert.equal('capabilities' in (serverInfo ?? {}), false);
+    assert.ok(serverInfo);
+    assert.equal(serverInfo.name, SERVER_NAME);
+    assert.match(serverInfo.version, /^0\.0\.0-test \[RUNPOD_REST_VERSION/);
+    assert.equal('capabilities' in serverInfo, false);
   });
 
   it('advertises tools and does not advertise resources', async () => {
