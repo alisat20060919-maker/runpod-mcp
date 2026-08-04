@@ -546,6 +546,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       const { handlers, outbound } = harness({ jsonBody: {} });
       // gpuTypeIds present so it stays on v2 (a GPU-less create routes to v1).
       await handlers.get('create-pod')!({
+        name: 'p',
         imageName: 'i',
         gpuTypeIds: ['A100'],
         volumeInGb: 40,
@@ -577,6 +578,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: { id: 'pod_multi' } });
       const out = (await handlers.get('create-pod')!({
+        name: 'p',
         imageName: 'i',
         gpuTypeIds: ['A100', 'H100', 'L40'],
       })) as { content: Array<{ text: string }> };
@@ -619,6 +621,31 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       const payload = JSON.parse(out.content[0].text);
       assert.equal(payload.status, 400);
       assert.match(payload.error, /A GPU pod needs gpuTypeIds/);
+    });
+  });
+
+  it('create-pod v2 GPU create with no name and no templateId → 400, no request (v2 requires name)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: {} });
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'i',
+        gpuTypeIds: ['A100'],
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 0, 'must not fire a request');
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400);
+      assert.match(payload.error, /Provide a name/);
+    });
+  });
+
+  it('create-pod v2 CPU pod without a name still routes to v1 (name is a v2-only requirement)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'pod_cpu' } });
+      await handlers.get('create-pod')!({
+        imageName: 'i',
+        computeType: 'CPU',
+      });
+      assert.equal(outbound[0].url, 'https://rest.runpod.io/v1/pods');
     });
   });
 
@@ -803,6 +830,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       // Must RESOLVE (not reject) so the model sees a readable error rather than
       // a raw thrown stack.
       const out = (await handlers.get('create-pod')!({
+        name: 'p',
         imageName: 'i',
         gpuTypeIds: ['A100'],
       })) as { content: Array<{ text: string }> };
@@ -819,6 +847,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     await withV2(async () => {
       const { handlers } = harness({ status: 501, jsonBody: {} });
       const out = (await handlers.get('create-pod')!({
+        name: 'p',
         imageName: 'i',
         gpuTypeIds: ['A100'],
       })) as { content: Array<{ text: string }> };
