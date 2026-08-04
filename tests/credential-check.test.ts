@@ -769,9 +769,26 @@ describe('env-mismatch guard keys off the RESOLVED host, not mere presence', () 
     );
   });
 
+  it('still runs when the RETIRED v2 default host is pinned (alias, not a move)', async () => {
+    // `v2-rest.runpod.io/v2` was the default before `api.runpod.io/v2` became
+    // canonical, and it is the same backend. A deployment that pinned it back
+    // when it WAS the default must not lose the pre-flight to a host rename.
+    assert.equal(
+      await gateRan({ RUNPOD_REST_V2_API_URL: 'https://v2-rest.runpod.io/v2' }),
+      true
+    );
+  });
+
   it('skips when a host genuinely points elsewhere and GraphQL was left behind', async () => {
     assert.equal(
       await gateRan({ RUNPOD_REST_API_URL: 'https://api.runpod.dev/v1' }),
+      false
+    );
+    // The alias covers the prod rename only. The dev host is a real different
+    // environment — normalizing it into prod would validate dev keys against
+    // prod GraphQL and 401 every request the tools could have served.
+    assert.equal(
+      await gateRan({ RUNPOD_REST_V2_API_URL: 'https://v2-rest.runpod.dev/v2' }),
       false
     );
   });
