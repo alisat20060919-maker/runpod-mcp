@@ -1,5 +1,6 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // Defense-in-depth: the v1 goldens assume the version env vars are unset. Clear
 // them before every test so a leak (from another test or the CI env) can't
@@ -20,7 +21,11 @@ beforeEach(() => {
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerTools } from '../src/tools.js';
-import { clearQueuedJobDiagnosisCache } from '../src/tools/jobs.js';
+import {
+  clearQueuedJobDiagnosisCache,
+  HTTP_LONG_POLL_BUDGET_MS,
+  STREAM_JOB_POLL_INTERVAL_MS,
+} from '../src/tools/jobs.js';
 
 // ============== Handler integration / outbound-request golden ==============
 // Drives the REAL registerTools against a fake McpServer (captures handlers) and
@@ -38,6 +43,9 @@ interface OutboundRecord {
 }
 
 function harness(opts?: {
+  // Transport the tools believe they run under (default stdio). 'http' engages
+  // the hosted long-poll clamps in jobs.ts.
+  transport?: 'stdio' | 'http';
   // What the fake fetch returns (defaults to an empty JSON array — a v1 list).
   jsonBody?: unknown;
   // A queue of bodies returned one-per-call (for poll loops like stream-job).
@@ -125,7 +133,7 @@ function harness(opts?: {
     fakeServer,
     {
       apiKey: 'rpa_test',
-      transport: 'stdio',
+      transport: opts?.transport ?? 'stdio',
       ...(opts?.onUnauthorized ? { onUnauthorized: opts.onUnauthorized } : {}),
     },
     {
@@ -1441,6 +1449,319 @@ describe('stream-job poll loop (sequenced responses)', () => {
     }
     assert.ok(outbound.length >= 2, 'should poll until terminal status');
     assert.ok(out, 'returns a result');
+  });
+});
+
+// ====== Hosted (HTTP) long-poll clamps ======
+// The hosted server runs under a 60s platform deadline (vercel.json
+// maxDuration), so on the 'http' transport runsync's server-side wait and
+// stream-job's poll loop are clamped to 45s — a budget the function can
+// actually finish inside. On stdio both keep their full budgets (locked by the
+// unchanged goldens above, which all run with the harness default 'stdio').
+describe('hosted HTTP transport clamps long-poll budgets', () => {
+  it('runsync-endpoint on http: explicit wait above the cap is clamped to 45000', async () => {
+    const { handlers, outbound } = harness({ transport: 'http', jsonBody: {} });
+    await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+      wait: 120000,
+    });
+    assert.equal(
+      outbound[0].url,
+      'https://api.runpod.ai/v2/ep_h/runsync?wait=45000'
+    );
+    // The clamp only rewrites the query — wait must stay out of the body.
+    assert.equal(
+      JSON.parse(outbound[0].body!).wait,
+      undefined,
+      'wait must not leak into the body'
+    );
+  });
+
+  it('runsync-endpoint on http: omitted wait is pinned to 45000 (upstream default of 90s exceeds the platform deadline)', async () => {
+    const { handlers, outbound } = harness({ transport: 'http', jsonBody: {} });
+    await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+    });
+    assert.equal(
+      outbound[0].url,
+      'https://api.runpod.ai/v2/ep_h/runsync?wait=45000'
+    );
+  });
+
+  it('runsync-endpoint on http: a wait already under the cap passes through untouched', async () => {
+    const { handlers, outbound } = harness({ transport: 'http', jsonBody: {} });
+    await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+      wait: 30000,
+    });
+    assert.equal(
+      outbound[0].url,
+      'https://api.runpod.ai/v2/ep_h/runsync?wait=30000'
+    );
+  });
+
+  it('runsync-endpoint on stdio: wait passes through unclamped (no platform deadline)', async () => {
+    const { handlers, outbound } = harness({ jsonBody: {} });
+    await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_s',
+      input: { a: 1 },
+      wait: 120000,
+    });
+    assert.equal(
+      outbound[0].url,
+      'https://api.runpod.ai/v2/ep_s/runsync?wait=120000'
+    );
+  });
+
+  // The clamp above is invisible in the reply, and an agent that reads a
+  // non-terminal status as "my 5-minute wait elapsed" cancels a job that is 45
+  // seconds old. These pin the marker that says otherwise — and, just as much,
+  // the three cases where it must stay quiet.
+  function waitClampedOf(out: unknown) {
+    return parseText(out).waitClamped as
+      | { requestedMs: number; effectiveMs: number; reason: string }
+      | undefined;
+  }
+
+  it('runsync-endpoint on http: a clamped wait with a non-terminal reply is marked waitClamped', async () => {
+    const { handlers } = harness({
+      transport: 'http',
+      jsonBody: { id: 'job1', status: 'IN_QUEUE' },
+    });
+    const out = await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+      wait: 300000,
+    });
+    const marker = waitClampedOf(out);
+    assert.ok(marker, 'non-terminal reply to a clamped wait must be marked');
+    assert.equal(marker.requestedMs, 300000);
+    assert.equal(marker.effectiveMs, HTTP_LONG_POLL_BUDGET_MS);
+    assert.match(marker.reason, /get-job-status/);
+    // Everything upstream sent still passes through untouched.
+    assert.equal(parseText(out).id, 'job1');
+    assert.equal(parseText(out).status, 'IN_QUEUE');
+  });
+
+  it('runsync-endpoint on http: a clamped wait that still COMPLETED is not marked', async () => {
+    const { handlers } = harness({
+      transport: 'http',
+      jsonBody: { id: 'job2', status: 'COMPLETED', output: { ok: true } },
+    });
+    const out = await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+      wait: 300000,
+    });
+    assert.equal(
+      waitClampedOf(out),
+      undefined,
+      'the job finished inside the budget — the clamp cost the caller nothing'
+    );
+  });
+
+  it('runsync-endpoint on http: a wait under the cap is never marked', async () => {
+    const { handlers } = harness({
+      transport: 'http',
+      jsonBody: { id: 'job3', status: 'IN_PROGRESS' },
+    });
+    const out = await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+      wait: 30000,
+    });
+    assert.equal(waitClampedOf(out), undefined);
+  });
+
+  it('runsync-endpoint on stdio: a long wait is never marked (nothing was clamped)', async () => {
+    const { handlers } = harness({
+      jsonBody: { id: 'job4', status: 'IN_QUEUE' },
+    });
+    const out = await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_s',
+      input: { a: 1 },
+      wait: 300000,
+    });
+    assert.equal(waitClampedOf(out), undefined);
+  });
+
+  it('runsync-endpoint on http: an omitted wait is marked against the 90s upstream default', async () => {
+    const { handlers } = harness({
+      transport: 'http',
+      jsonBody: { id: 'job5', status: 'IN_QUEUE' },
+    });
+    const out = await handlers.get('runsync-endpoint')!({
+      endpointId: 'ep_h',
+      input: { a: 1 },
+    });
+    const marker = waitClampedOf(out);
+    assert.ok(marker, 'the upstream 90s default is clamped too');
+    assert.equal(marker.requestedMs, 90000);
+    assert.equal(marker.effectiveMs, HTTP_LONG_POLL_BUDGET_MS);
+  });
+
+  // Drive stream-job's poll loop on a fully deterministic clock and return what
+  // it produced. Two clocks matter: setTimeout (the 1s poll sleep) and Date.now
+  // (the budget check). setTimeout is mocked via node:test mock timers — Node
+  // >=20.11 takes `{apis}`, Node 18 takes a bare array, so try both. Date is NOT
+  // mockable on Node 18 at all, so the budget clock is stubbed by hand on every
+  // version and advanced in lockstep with the ticks.
+  async function driveStreamJobToBudget(
+    t: {
+      mock: {
+        timers: { enable: (o: unknown) => void; tick: (ms: number) => void };
+      };
+    },
+    opts: { transport: 'stdio' | 'http'; endpointId: string; ticks: number }
+  ) {
+    const enable = t.mock?.timers?.enable;
+    if (typeof enable !== 'function') {
+      throw new Error(
+        'node:test mock timers unavailable (needs Node >=18.19) — this test cannot run on this runtime'
+      );
+    }
+    try {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+    } catch (err) {
+      // Node 18 takes a bare array and rejects the object form with a TypeError
+      // naming the `timers` argument. Anything else is a real failure, not a
+      // signature mismatch, so don't swallow it behind a second attempt.
+      if (!(err instanceof TypeError)) throw err;
+      (t.mock.timers.enable as unknown as (apis: string[]) => void)([
+        'setTimeout',
+      ]);
+    }
+    let fakeNow = 0;
+    const realNow = Date.now;
+    Date.now = () => fakeNow;
+    try {
+      const { handlers, outbound } = harness({
+        transport: opts.transport,
+        // Never terminal — only the budget can end the loop.
+        jsonBody: { status: 'IN_PROGRESS', stream: [{ chunk: 'x' }] },
+      });
+      const pending = handlers.get('stream-job')!({
+        endpointId: opts.endpointId,
+        jobId: 'jH',
+      });
+      // setImmediate is NOT mocked, so each round lets the in-flight poll (fake
+      // fetch + json()) settle before advancing both clocks by one real poll
+      // interval — imported, not hardcoded, so halving the interval in the
+      // source can't double the live request rate with these tests still green.
+      for (let i = 0; i < opts.ticks; i++) {
+        await new Promise((r) => setImmediate(r));
+        fakeNow += STREAM_JOB_POLL_INTERVAL_MS;
+        t.mock.timers.tick(STREAM_JOB_POLL_INTERVAL_MS);
+      }
+      await new Promise((r) => setImmediate(r));
+      // The loop MUST have ended by now. If a regression widened the budget it
+      // would still be polling, and a bare `await pending` would hang forever —
+      // node:test has no default timeout, so that stalls this file's remaining
+      // ~90 tests until CI's job timeout instead of failing here.
+      const ended = await Promise.race([
+        pending.then(() => true),
+        new Promise((r) => setImmediate(() => r(false))),
+      ]);
+      if (!ended) {
+        throw new Error(
+          `stream-job was still polling after ${opts.ticks} ticks (${
+            (opts.ticks * STREAM_JOB_POLL_INTERVAL_MS) / 1000
+          }s of fake time) — its budget is larger than this test expects`
+        );
+      }
+      const out = (await pending) as { content: Array<{ text: string }> };
+      return {
+        outbound,
+        result: JSON.parse(out.content[0].text) as {
+          pollingTimedOut?: boolean;
+          note?: string;
+          stream: unknown[];
+        },
+      };
+    } finally {
+      Date.now = realNow;
+    }
+  }
+
+  it('stream-job on http: stops polling at 45s and returns collected chunks with the resume note', async (t) => {
+    const { outbound, result } = await driveStreamJobToBudget(t, {
+      transport: 'http',
+      endpointId: 'ep_h',
+      ticks: 60,
+    });
+    assert.equal(result.pollingTimedOut, true);
+    assert.match(result.note!, /45 seconds/);
+    assert.match(result.note!, /Call stream-job again/);
+    // Collected chunks survive the budget cut.
+    assert.ok(result.stream.length > 0, 'keeps chunks collected so far');
+    // The clock is fully deterministic, so pin the exact count rather than a
+    // window: poll k tests (k-1)*1000 > 45000, first true at k=47. A range would
+    // silently accept the budget drifting to 40s or 50s — the very constant
+    // this test exists to lock.
+    assert.equal(
+      outbound.length,
+      47,
+      `polled ${outbound.length} times; expected 47 (45s budget / 1s interval)`
+    );
+    // Every http poll caps the upstream hold: an empty /stream otherwise blocks
+    // ~10s server-side, overshooting the budget toward the platform reaper.
+    for (const rec of outbound) {
+      assert.equal(
+        rec.url,
+        'https://api.runpod.ai/v2/ep_h/stream/jH?wait=1000'
+      );
+    }
+  });
+
+  it('stream-job on stdio: keeps the full 5-minute budget and bare poll URLs', async (t) => {
+    // The mirror of the case above, and the only thing stopping someone from
+    // "simplifying" the transport ternary into one 45s budget for both: without
+    // this, every other test still passes when stdio gets clamped too.
+    const { outbound, result } = await driveStreamJobToBudget(t, {
+      transport: 'stdio',
+      endpointId: 'ep_s',
+      ticks: 320,
+    });
+    assert.equal(result.pollingTimedOut, true);
+    // Rendered in minutes, matching the tool's own description.
+    assert.match(result.note!, /5 minutes/);
+    // Poll k tests (k-1)*1000 > 300000, first true at k=302 — still polling
+    // long past the 47 the hosted budget allows.
+    assert.equal(
+      outbound.length,
+      302,
+      `polled ${outbound.length} times; expected 302 (300s budget / 1s interval)`
+    );
+    // No wait cap upstream: stdio has no platform deadline to race.
+    for (const rec of outbound) {
+      assert.equal(rec.url, 'https://api.runpod.ai/v2/ep_s/stream/jH');
+    }
+  });
+
+  it('the hosted budget still fits inside vercel.json maxDuration, with room for the pre-flight', () => {
+    // The clamp's entire premise is a relationship between two files that
+    // nothing else connects. Raise maxDuration and the budget silently stays
+    // low; lower it and the reaping is back with every other test green.
+    const vercel = JSON.parse(
+      readFileSync(new URL('../vercel.json', import.meta.url), 'utf8')
+    ) as { functions?: Record<string, { maxDuration?: number }> };
+    const maxDuration = Object.values(vercel.functions ?? {}).find(
+      (f) => typeof f.maxDuration === 'number'
+    )?.maxDuration;
+    assert.ok(
+      typeof maxDuration === 'number',
+      'vercel.json no longer declares a maxDuration — the budget below is derived from it'
+    );
+    // 8s covers the credential pre-flight (4s) and the v2 probe (4s), both of
+    // which run before the tool does; the rest is serialization + cold start.
+    const PRE_FLIGHT_HEADROOM_MS = 8_000;
+    assert.ok(
+      HTTP_LONG_POLL_BUDGET_MS + PRE_FLIGHT_HEADROOM_MS <= maxDuration * 1000,
+      `HTTP_LONG_POLL_BUDGET_MS (${HTTP_LONG_POLL_BUDGET_MS}) + pre-flight headroom (${PRE_FLIGHT_HEADROOM_MS}) exceeds maxDuration (${maxDuration}s). Adjust the budget in src/tools/jobs.ts to match.`
+    );
   });
 });
 
