@@ -205,6 +205,74 @@ describe('outbound-request golden (v1 unchanged)', () => {
     assert.equal(outbound[0].body, JSON.stringify(params));
   });
 
+  it('create-pod v1 sshPublicKey → PUBLIC_KEY env + 22/tcp, param itself never on the wire', async () => {
+    const { handlers, outbound } = harness({ jsonBody: { id: 'pod_1' } });
+    const out = (await handlers.get('create-pod')!({
+      imageName: 'img:1',
+      env: { FOO: 'bar' },
+      sshPublicKey: 'ssh-ed25519 AAAA me@laptop',
+    })) as { content: Array<{ text: string }> };
+    const body = JSON.parse(outbound[0].body!);
+    assert.equal('sshPublicKey' in body, false); // MCP-side param, not an API field
+    assert.deepEqual(body.ports, ['22/tcp']);
+    assert.deepEqual(body.env, {
+      FOO: 'bar',
+      PUBLIC_KEY: 'ssh-ed25519 AAAA me@laptop',
+    });
+    // Reply carries the SSH note so the caller knows what full SSH still needs.
+    const payload = JSON.parse(out.content[0].text);
+    assert.match(payload._ssh, /PUBLIC_KEY env set and 22\/tcp exposed/);
+  });
+
+  it('create-pod rejects a PRIVATE key in sshPublicKey, fires no request', async () => {
+    const { handlers, outbound } = harness({ jsonBody: {} });
+    const out = (await handlers.get('create-pod')!({
+      imageName: 'img:1',
+      sshPublicKey: '-----BEGIN OPENSSH PRIVATE KEY-----\nabc',
+    })) as { content: Array<{ text: string }> };
+    assert.equal(outbound.length, 0);
+    const payload = JSON.parse(out.content[0].text);
+    assert.equal(payload.status, 400);
+    assert.match(payload.error, /PRIVATE key/);
+  });
+
+  // An unusable sshPublicKey must fail BEFORE the pod exists. Previously each of
+  // these created a pod with 22/tcp exposed, junk in PUBLIC_KEY, and an _ssh note
+  // claiming SSH was configured — a billing pod nobody could log into.
+  it('create-pod rejects an unusable sshPublicKey, fires no request and no _ssh note', async () => {
+    for (const bad of [
+      '   ', // whitespace-only: truthy, used to set PUBLIC_KEY: ''
+      '~/.ssh/id_ed25519.pub', // a path instead of the file's contents
+      'SHA256:abc123def', // a fingerprint
+      'AAAAC3NzaC1lZDI1NTE5AAAAIexample', // base64 blob, no key type
+      'PuTTY-User-Key-File-2: ssh-ed25519\nPrivate-Lines: 1\nAAAA', // .ppk
+    ]) {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'pod_1' } });
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'img:1',
+        sshPublicKey: bad,
+      })) as { content: Array<{ text: string }> };
+      assert.equal(outbound.length, 0, `fired a request for ${bad}`);
+      const payload = JSON.parse(out.content[0].text);
+      assert.equal(payload.status, 400, `accepted ${bad}`);
+      assert.equal(payload._ssh, undefined);
+    }
+  });
+
+  it('create-pod normalizes CRLF and multiple keys before they reach PUBLIC_KEY', async () => {
+    const { handlers, outbound } = harness({ jsonBody: { id: 'pod_1' } });
+    await handlers.get('create-pod')!({
+      imageName: 'img:1',
+      sshPublicKey:
+        '  ssh-ed25519 AAAA me@laptop\r\n\r\nssh-rsa BBBB other@host\n',
+    });
+    const body = JSON.parse(outbound[0].body!);
+    // One key per line, no \r — a stray carriage return corrupts authorized_keys.
+    assert.deepEqual(body.env, {
+      PUBLIC_KEY: 'ssh-ed25519 AAAA me@laptop\nssh-rsa BBBB other@host',
+    });
+  });
+
   it('stop-pod → POST <rest>/v1/pods/{id}/stop', async () => {
     const { handlers, outbound } = harness({ jsonBody: {} });
     await handlers.get('stop-pod')!({ podId: 'pod_9' });
@@ -585,6 +653,23 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
     });
   });
 
+  it('create-pod v2 CPU pod applies sshPublicKey on the v1 passthrough body too', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'pod_cpu' } });
+      const out = (await handlers.get('create-pod')!({
+        imageName: 'i',
+        computeType: 'CPU',
+        sshPublicKey: 'ssh-ed25519 AAAA me@laptop',
+      })) as { content: Array<{ text: string }> };
+      const body = JSON.parse(outbound[0].body!);
+      assert.equal('sshPublicKey' in body, false);
+      assert.deepEqual(body.ports, ['22/tcp']);
+      assert.deepEqual(body.env, { PUBLIC_KEY: 'ssh-ed25519 AAAA me@laptop' });
+      const payload = JSON.parse(out.content[0].text);
+      assert.match(payload._ssh, /PUBLIC_KEY env set/);
+    });
+  });
+
   it('create-pod v2 with >1 gpuTypeId → succeeds, warns only the first was used', async () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: { id: 'pod_multi' } });
@@ -594,7 +679,10 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
         gpuTypeIds: ['A100', 'H100', 'L40'],
       })) as { content: Array<{ text: string }> };
       // v2 gpu is singular — only the first id reaches the wire.
-      assert.deepEqual(JSON.parse(outbound[0].body!).gpu, { id: 'A100' });
+      assert.deepEqual(JSON.parse(outbound[0].body!).gpu, {
+        id: 'A100',
+        count: 1,
+      });
       const payload = JSON.parse(out.content[0].text);
       assert.match(payload._warning, /one GPU type/);
       assert.match(payload._warning, /H100/);
@@ -720,10 +808,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       });
       assert.equal(outbound.length, 2);
       // 1) template GET
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/templates/tpl_1'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/templates/tpl_1');
       assert.equal(outbound[0].method, 'GET');
       // 2) pod POST with the template's container config folded in
       assert.equal(outbound[1].url, 'https://api.runpod.io/v2/pods');
@@ -736,7 +821,7 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       assert.deepEqual(body.env, { FOO: 'bar' });
       assert.equal(body.registry, 'cra_9'); // registry inherited so private images pull
       assert.equal(body.name, 'pytorch-template'); // pod-name default from template
-      assert.deepEqual(body.gpu, { id: 'A100' }); // caller-supplied compute
+      assert.deepEqual(body.gpu, { id: 'A100', count: 1 }); // caller-supplied compute
       // template-only fields never reach the pod body
       assert.equal('serverless' in body, false);
       assert.equal('category' in body, false);
@@ -763,6 +848,44 @@ describe('pod routing under RUNPOD_REST_VERSION=v2', () => {
       assert.equal(body.disk, 100); // caller disk wins
       assert.equal(body.registry, 'cra_override'); // caller registry overrides template's cra_9
       assert.equal(body.args, 'python -u handler.py'); // untouched template field stays
+    });
+  });
+
+  it('create-pod v2 sshPublicKey → PUBLIC_KEY env + 22/tcp appended to the mapped body', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'pod_new' } });
+      await handlers.get('create-pod')!({
+        name: 'p',
+        imageName: 'img:1',
+        gpuTypeIds: ['A100'],
+        ports: ['8888/http'],
+        sshPublicKey: 'ssh-ed25519 AAAA me@laptop',
+      });
+      const body = JSON.parse(outbound[0].body!);
+      assert.equal('sshPublicKey' in body, false);
+      assert.deepEqual(body.ports, ['8888/http', '22/tcp']);
+      assert.deepEqual(body.env, { PUBLIC_KEY: 'ssh-ed25519 AAAA me@laptop' });
+    });
+  });
+
+  it('create-pod v2 sshPublicKey EXTENDS template ports/env (applied after the merge)', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({
+        jsonBodies: [TEMPLATE_JSON, { id: 'pod_new' }],
+      });
+      await handlers.get('create-pod')!({
+        templateId: 'tpl_1',
+        gpuTypeIds: ['A100'],
+        sshPublicKey: 'ssh-ed25519 AAAA me@laptop',
+      });
+      const body = JSON.parse(outbound[1].body!);
+      // Template ports/env survive with the SSH additions folded in — NOT the
+      // whole-field replacement that a caller-passed ports/env would cause.
+      assert.deepEqual(body.ports, ['8888/http', '22/tcp']);
+      assert.deepEqual(body.env, {
+        FOO: 'bar',
+        PUBLIC_KEY: 'ssh-ed25519 AAAA me@laptop',
+      });
     });
   });
 
@@ -976,10 +1099,7 @@ describe('template / network-volume / registry routing under v2', () => {
         jsonBody: { networkVolumes: [] },
       });
       await handlers.get('list-network-volumes')!({});
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/network-volumes'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/network-volumes');
     });
   });
 
@@ -991,10 +1111,7 @@ describe('template / network-volume / registry routing under v2', () => {
         size: 50,
         dataCenterId: 'EU-RO-1',
       });
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/network-volumes'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/network-volumes');
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.dataCenter, 'EU-RO-1');
       assert.equal('dataCenterId' in body, false);
@@ -1019,10 +1136,7 @@ describe('template / network-volume / registry routing under v2', () => {
         templateId: 't_1',
         imageName: 'img2',
       });
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/templates/t_1'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/templates/t_1');
       assert.equal(outbound[0].method, 'PATCH');
       const body = JSON.parse(outbound[0].body!);
       assert.equal(body.image, 'img2'); // v2 mapper maps it
@@ -1239,10 +1353,7 @@ describe('catalog routing (B5)', () => {
       const out = (await handlers.get('list-gpu-types')!({
         includeAvailability: false,
       })) as { content: Array<{ text: string }> };
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/catalog/gpus'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/catalog/gpus');
       // no availability data → nothing filtered out
       assert.equal(JSON.parse(out.content[0].text).items.length, 2);
     });
@@ -1346,10 +1457,7 @@ describe('catalog routing (B5)', () => {
       const out = (await handlers.get('list-cpu-types')!({})) as {
         content: Array<{ text: string }>;
       };
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/catalog/cpus'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/catalog/cpus');
       assert.deepEqual(JSON.parse(out.content[0].text).items, [
         { id: 'cpu5c' },
       ]);
@@ -1982,10 +2090,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
         endpointId: 'ep_1',
         includeTemplate: true,
       });
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/serverless/ep_1'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/serverless/ep_1');
     });
   });
 
@@ -2178,10 +2283,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
       });
       assert.equal(outbound.length, 2);
       assert.equal(outbound[0].method, 'GET');
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/serverless/ep_1'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/serverless/ep_1');
       assert.equal(outbound[1].method, 'PATCH');
       assert.deepEqual(JSON.parse(outbound[1].body!).scaling, {
         type: 'REQUEST_COUNT',
@@ -2250,10 +2352,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
         workersMax: 5,
         imageName: 'img:3',
       });
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/serverless/ep_1'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/serverless/ep_1');
       assert.equal(outbound[0].method, 'PATCH');
       const body = JSON.parse(outbound[0].body!);
       assert.deepEqual(body.workers, { max: 5 });
@@ -2266,10 +2365,7 @@ describe('endpoint routing under RUNPOD_REST_VERSION=v2', () => {
     await withV2(async () => {
       const { handlers, outbound } = harness({ jsonBody: {} });
       await handlers.get('delete-endpoint')!({ endpointId: 'ep_1' });
-      assert.equal(
-        outbound[0].url,
-        'https://api.runpod.io/v2/serverless/ep_1'
-      );
+      assert.equal(outbound[0].url, 'https://api.runpod.io/v2/serverless/ep_1');
       assert.equal(outbound[0].method, 'DELETE');
     });
   });
@@ -2359,10 +2455,7 @@ describe('log streaming tools (v2-only)', () => {
       const out = await handlers.get('stream-pod-logs')!({ podId: 'pod_1' });
       assert.equal(calls.length, 1);
       // `source: both` is the default → NO source query param.
-      assert.equal(
-        calls[0].url,
-        'https://api.runpod.io/v2/pods/pod_1/logs'
-      );
+      assert.equal(calls[0].url, 'https://api.runpod.io/v2/pods/pod_1/logs');
       assert.equal(calls[0].maxWaitMs, 5000);
       assert.equal(calls[0].maxBytes, 256 * 1024);
       const body = parseText(out);

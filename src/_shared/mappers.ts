@@ -86,14 +86,18 @@ function containerConfigToV2(p: {
 
 // gpuTypeIds[] + gpuCount → gpu: { id, count }. v2 GpuConfig requires `id`, so
 // return undefined for a count-only input — an idless gpu would be rejected
-// (422). count is optional (defaults to 1 server-side).
+// (422). `count` is documented as optional (defaults to 1 server-side), but in
+// practice omitting it makes the scheduler match ZERO machines and every create
+// fails with a misleading "no instances available" 400 (observed live
+// 2026-08-04, both v2 hosts; the identical body with count:1 succeeds). So
+// always emit the documented default explicitly.
 function gpuConfigToV2(
   gpuTypeIds?: string[],
   gpuCount?: number
 ): Record<string, unknown> | undefined {
   const id = gpuTypeIds?.[0];
   if (id === undefined) return undefined;
-  return compact({ id, count: gpuCount });
+  return { id, count: gpuCount ?? 1 };
 }
 
 export function mapPodCreateToV2(params: V1PodParams): Record<string, unknown> {
@@ -365,6 +369,101 @@ export function podBodyFromTemplate(
     if (value !== undefined && value !== null) out[key] = value;
   }
   return out;
+}
+
+// ---- SSH convenience (create-pod sshPublicKey param) ----
+
+// An OpenSSH public key line: key-type token, then the base64 blob (a trailing
+// comment is optional). `ssh-*` covers rsa/ed25519/dss, `ecdsa-*` the NIST curves,
+// `sk-*` FIDO/U2F security keys. authorized_keys also permits a leading options
+// field (`no-port-forwarding ssh-rsa …`), which a .pub file never carries —
+// accepting arbitrary leading tokens would defeat the point of validating, so an
+// options-prefixed line is rejected with the format message.
+const SSH_PUBLIC_KEY_LINE =
+  /^(ssh-[a-z0-9-]+|ecdsa-[a-z0-9-]+|sk-[a-z0-9@.-]+)\s+\S+/i;
+
+// Any spelling of "private key" in any case, plus PuTTY's own header — a .ppk
+// says `PuTTY-User-Key-File-2` and keeps its secret under `Private-Lines`, so it
+// never contains the words the PEM guard looks for.
+const PRIVATE_KEY_MARKER = /private[-\s]?key|PuTTY-User-Key-File/i;
+
+export type SshPublicKeyResult =
+  | { ok: true; key: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate and normalize the caller-supplied SSH public key(s).
+ *
+ * Anything that is not a usable public key must be rejected BEFORE a pod is
+ * created: an unusable value still exposed 22/tcp, wrote junk into PUBLIC_KEY,
+ * and returned the "SSH configured" note, leaving a running, billing pod that
+ * nobody can log into and no indication of why. Both real cases fail that way —
+ * a path (`~/.ssh/id_ed25519.pub`) or a fingerprint (`SHA256:…`) passed instead
+ * of the file's contents, which is the mistake an LLM filling this param makes.
+ *
+ * Empty or whitespace-only is an error, not a silent skip: the way to say "no
+ * SSH" is to omit the param, so a blank value is a caller bug, and failing here
+ * is cheaper than a pod that cannot be reached.
+ *
+ * Normalizes CRLF and per-line whitespace. authorized_keys is one key per line,
+ * and a stray \r would corrupt the entry it lands on.
+ *
+ * The error messages never echo the input: a rejected value may be secret
+ * (a header-stripped private blob), and the reply is logged by every client.
+ */
+export function normalizeSshPublicKey(input: string): SshPublicKeyResult {
+  if (PRIVATE_KEY_MARKER.test(input))
+    return {
+      ok: false,
+      error:
+        'sshPublicKey looks like a PRIVATE key. Pass the PUBLIC key instead — the contents of your ~/.ssh/<key>.pub file (e.g. "ssh-ed25519 AAAA…").',
+    };
+  const lines = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0)
+    return {
+      ok: false,
+      error:
+        'sshPublicKey is empty. Pass the contents of your ~/.ssh/<key>.pub file, or omit the parameter entirely to create the pod without SSH.',
+    };
+  if (lines.some((line) => !SSH_PUBLIC_KEY_LINE.test(line)))
+    return {
+      ok: false,
+      error:
+        'sshPublicKey is not an SSH public key. Expected the CONTENTS of your ~/.ssh/<key>.pub file — a line like "ssh-ed25519 AAAAC3Nza… you@host" (ssh-*, ecdsa-*, or sk-* followed by the base64 key) — not a file path, a SHA256 fingerprint, or a bare base64 blob. Newline-separate multiple keys.',
+    };
+  return { ok: true, key: lines.join('\n') };
+}
+
+// The REST API has no SSH switch yet: the console and runpodctl set GraphQL
+// `startSsh`, which injects the account's registered keys as a PUBLIC_KEY env
+// var that official images install into authorized_keys before starting sshd.
+// Until REST v2 ships its own startSsh field, create-pod reproduces the
+// convention client-side from a caller-supplied key: merge the key into
+// env.PUBLIC_KEY and make sure 22/tcp is exposed. Must run on the FINAL body
+// (after any template merge) so a template's ports/env are extended, not
+// clobbered. Works on v1 and v2 bodies alike — `ports` and `env` have the
+// same shape on both.
+export function applySshPublicKey(
+  body: Record<string, unknown>,
+  sshPublicKey: string
+): Record<string, unknown> {
+  const ports = Array.isArray(body.ports) ? (body.ports as string[]) : [];
+  const hasSshPort = ports.some((p) => /^\s*22\/tcp\s*$/i.test(String(p)));
+  const env = { ...((body.env as Record<string, string> | undefined) ?? {}) };
+  const key = sshPublicKey.trim();
+  // A PUBLIC_KEY already present (caller's env or the template's) stays
+  // authorized: authorized_keys is one key per line, so append, don't replace.
+  if (!env.PUBLIC_KEY) env.PUBLIC_KEY = key;
+  else if (!env.PUBLIC_KEY.includes(key))
+    env.PUBLIC_KEY = `${env.PUBLIC_KEY}\n${key}`;
+  return {
+    ...body,
+    ports: hasSshPort ? ports : [...ports, '22/tcp'],
+    env,
+  };
 }
 
 interface V1TemplateUpdate {
