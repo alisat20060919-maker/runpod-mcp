@@ -1426,11 +1426,44 @@ describe('catalog routing (B5)', () => {
       })) as { content: Array<{ text: string }> };
       assert.equal(
         outbound[0].url,
-        'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY'
+        'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=POD'
       );
       const payload = JSON.parse(out.content[0].text).items;
       assert.equal(payload.length, 1);
       assert.equal(payload[0].id, 'a100');
+    });
+  });
+
+  it('list-gpu-types v2 passes product through; omits it (and include) when availability is off', async () => {
+    await withV2(async () => {
+      const serverless = harness({ jsonBody: { gpus: [] } });
+      await serverless.handlers.get('list-gpu-types')!({
+        product: 'SERVERLESS',
+      });
+      assert.equal(
+        serverless.outbound[0].url,
+        'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=SERVERLESS'
+      );
+      // product without include=AVAILABILITY is a 400 upstream, so it must
+      // not be sent when the availability lookup is skipped
+      const off = harness({ jsonBody: { gpus: [] } });
+      await off.handlers.get('list-gpu-types')!({
+        product: 'SERVERLESS',
+        includeAvailability: false,
+      });
+      assert.equal(
+        off.outbound[0].url,
+        'https://api.runpod.io/v2/catalog/gpus'
+      );
+      // a zod-bypassed junk product falls back to POD rather than 400ing
+      const junk = harness({ jsonBody: { gpus: [] } });
+      await junk.handlers.get('list-gpu-types')!({
+        product: 'BOGUS' as never,
+      });
+      assert.equal(
+        junk.outbound[0].url,
+        'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=POD'
+      );
     });
   });
 
@@ -1617,10 +1650,10 @@ describe('catalog routing (B5)', () => {
       const out = (await handlers.get('get-gpu-type')!({
         gpuTypeId: 'a100',
       })) as { content: Array<{ text: string }> };
-      // availability is requested by default
+      // availability is requested by default, with its required product context
       assert.equal(
         outbound[0].url,
-        'https://api.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY'
+        'https://api.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY&product=POD'
       );
       // raw passthrough (no unwrap) — body preserved
       assert.deepEqual(JSON.parse(out.content[0].text), {
@@ -1640,6 +1673,20 @@ describe('catalog routing (B5)', () => {
       assert.equal(
         outbound[0].url,
         'https://api.runpod.io/v2/catalog/gpus/NVIDIA%20GeForce%20RTX%204090'
+      );
+    });
+  });
+
+  it('get-gpu-type v2 passes product through with the availability request', async () => {
+    await withV2(async () => {
+      const { handlers, outbound } = harness({ jsonBody: { id: 'a100' } });
+      await handlers.get('get-gpu-type')!({
+        gpuTypeId: 'a100',
+        product: 'SERVERLESS',
+      });
+      assert.equal(
+        outbound[0].url,
+        'https://api.runpod.io/v2/catalog/gpus/a100?include=AVAILABILITY&product=SERVERLESS'
       );
     });
   });

@@ -8,6 +8,11 @@ import { READ_ONLY, type ToolRuntime } from './runtime.js';
 // catalog (GET /v2/catalog/*). The adapter picks the backend; v2-only entries
 // return a 501 notice on v1.
 
+// Availability product contexts accepted by the v2 GPU catalog. Availability is
+// product-specific, so the API requires `product` with include=AVAILABILITY —
+// and rejects it without (400 either way).
+const GPU_PRODUCTS = new Set(['POD', 'CLUSTER', 'SERVERLESS']);
+
 export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
   const { jsonReply, graphql, callRestUrl, backendFor } = rt;
 
@@ -47,20 +52,33 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         .describe(
           'Request realtime stock and annotate each GPU with an availability summary (HIGH/MEDIUM/LOW/NONE). Default true. Set false to skip the availability lookup — then out-of-stock GPUs cannot be filtered.'
         ),
+      product: z
+        .enum(['POD', 'CLUSTER', 'SERVERLESS'])
+        .optional()
+        .describe(
+          'Product context for the availability lookup — the same GPU can be scarce for Pods and plentiful for Serverless. Default POD. Use SERVERLESS when picking a GPU for an endpoint, CLUSTER for Instant Clusters. Ignored when includeAvailability is false.'
+        ),
     },
     { title: 'List GPU types', ...READ_ONLY },
     async (params) => {
       const backend = backendFor('gpus');
       if (backend.version === 'v2') {
-        // v2 REST: GET /v2/catalog/gpus?include=AVAILABILITY → { gpus: [...] },
-        // each with an `availability` summary (HIGH/MEDIUM/LOW/NONE) and a
-        // per-datacenter `dataCenters` breakdown. Filters re-applied against v2
-        // field names. Opt out with includeAvailability:false (then the
-        // filter/sort below no-op, since there's no data).
+        // v2 REST: GET /v2/catalog/gpus?include=AVAILABILITY&product=… →
+        // { gpus: [...] }, each with an `availability` summary
+        // (HIGH/MEDIUM/LOW/NONE) and a per-datacenter `dataCenters` breakdown.
+        // Filters re-applied against v2 field names. Opt out with
+        // includeAvailability:false (then the filter/sort below no-op, since
+        // there's no data). `product` rides along exactly when availability is
+        // requested — the API requires it with include=AVAILABILITY and
+        // rejects it without. Re-validated here because direct handler calls
+        // can bypass zod (same stance as get-capacity).
         const wantAvailability = params.includeAvailability !== false;
+        const product = GPU_PRODUCTS.has(String(params.product))
+          ? String(params.product)
+          : 'POD';
         const raw = await callRestUrl(
           `${backend.base}${backend.list}${
-            wantAvailability ? '?include=AVAILABILITY' : ''
+            wantAvailability ? `?include=AVAILABILITY&product=${product}` : ''
           }`
         );
         let gpus = backend.unwrap(raw) as Array<Record<string, unknown>>;
@@ -303,6 +321,12 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         .describe(
           'Include realtime per-datacenter availability (HIGH/MEDIUM/LOW/NONE). Default true.'
         ),
+      product: z
+        .enum(['POD', 'CLUSTER', 'SERVERLESS'])
+        .optional()
+        .describe(
+          'Product context for the availability lookup — stock differs by product. Default POD. Use SERVERLESS when picking a GPU for an endpoint, CLUSTER for Instant Clusters. Ignored when includeAvailability is false.'
+        ),
     },
     { title: 'Get GPU type', ...READ_ONLY },
     async (params) => {
@@ -315,10 +339,17 @@ export function registerCatalogTools(server: McpServer, rt: ToolRuntime): void {
         });
       }
       // GPU ids contain spaces (e.g. "NVIDIA GeForce RTX 4090"), so encode the
-      // path segment. Availability on by default — it's the point of a single GPU.
+      // path segment. Availability on by default — it's the point of a single
+      // GPU. `product` goes with it (required with include=AVAILABILITY,
+      // rejected without); re-validated for zod-bypassed direct calls.
       const path = backend.get!(encodeURIComponent(params.gpuTypeId));
+      const product = GPU_PRODUCTS.has(String(params.product))
+        ? String(params.product)
+        : 'POD';
       const query =
-        params.includeAvailability === false ? '' : '?include=AVAILABILITY';
+        params.includeAvailability === false
+          ? ''
+          : `?include=AVAILABILITY&product=${product}`;
       const result = await callRestUrl(`${backend.base}${path}${query}`);
       return jsonReply(result);
     }
